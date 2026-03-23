@@ -1,6 +1,7 @@
 from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
-from sqlalchemy.ext.asyncio import AsyncSession
+from aiogram.filters import Command
+from aiogram.filters.state import StateFilter
 from sqlalchemy import select
 from src.database.models import User, Service
 from src.database.session import async_session_maker
@@ -10,27 +11,46 @@ from src.core.security import security_service
 from src.core.logger import setup_logger
 
 logger = setup_logger(__name__)
-
 router = Router()
 
 
-@router.message(F.text == "/add")
+async def _save_service_for_user(
+    tg_id: int,
+    username: str | None,
+    service_name: str,
+    encrypted_key: str,
+) -> None:
+    async with async_session_maker() as session:
+        result = await session.execute(select(User).where(User.tg_id == tg_id))
+        user = result.scalar_one_or_none()
+
+        if not user:
+            user = User(tg_id=tg_id, username=username)
+            session.add(user)
+            await session.flush()
+
+        service = Service(
+            user_id=user.id,
+            service_name=service_name,
+            connection_type="api",
+            credentials={"api_key": encrypted_key},
+            is_active=True,
+        )
+        session.add(service)
+        await session.commit()
+
+
+@router.message(Command("add"))
 async def cmd_add(message: types.Message, state: FSMContext):
-    """Команда /add - начало добавления сервиса"""
     await state.set_state(AddServiceStates.selecting_service)
     await message.answer(
-        "🔌 <b>Добавление сервиса</b>\n\n"
-        "Выберите сервис, который хотите добавить:",
+        "🔌 <b>Добавление сервиса</b>\n\nВыберите сервис:",
         reply_markup=get_services_keyboard()
     )
 
 
 @router.callback_query(F.data.startswith("add_service_"))
-async def process_service_selection(
-    callback: types.CallbackQuery,
-    state: FSMContext
-):
-    """Обработка выбора сервиса"""
+async def process_service_selection(callback: types.CallbackQuery, state: FSMContext):
     service_name = callback.data.replace("add_service_", "")
     
     if service_name == "cancel":
@@ -39,98 +59,99 @@ async def process_service_selection(
         await callback.answer()
         return
     
-    # Сохраняем выбранный сервис
     await state.update_data(selected_service=service_name)
     await state.set_state(AddServiceStates.entering_api_key)
     
     await callback.message.edit_text(
         f"🔑 <b>Введите API-ключ для {service_name.title()}</b>\n\n"
-        "Отправьте ключ в следующем сообщении.\n"
-        "Для отмены нажмите /cancel",
+        "Отправьте токен в следующем сообщении.\n"
+        "⚠️ <b>Важно:</b> Отправьте именно токен (начинается на eyJ...), а не команду!\n\n"
+        "Для отмены: /cancel",
         reply_markup=get_cancel_keyboard()
     )
     await callback.answer()
 
 
-@router.message(AddServiceStates.entering_api_key, F.text)
-async def process_api_key_input(
-    message: types.Message,
-    state: FSMContext
-):
-    """Обработка ввода API-ключа"""
+@router.message(StateFilter(AddServiceStates.entering_api_key), F.text)
+async def process_api_key_input(message: types.Message, state: FSMContext):
     api_key = message.text.strip()
     
-    # Шифруем ключ
-    encrypted_key = security_service.encrypt(api_key)
+    # Проверка: JWT токен должен начинаться с eyJ
+    if not api_key.startswith('eyJ'):
+        await message.answer(
+            "❌ <b>Неверный формат токена!</b>\n\n"
+            "JWT-токен должен начинаться с <code>eyJ</code>."
+        )
+        return
     
-    # Сохраняем в состояние
-    await state.update_data(api_key=encrypted_key)
-    await state.set_state(AddServiceStates.confirming)
+    # Проверка: минимальная длина
+    if len(api_key) < 50:
+        await message.answer(
+            "❌ <b>Токен слишком короткий!</b>\n\n"
+            "Обычно JWT-токены длиннее 50 символов."
+        )
+        return
     
-    await message.answer(
-        "✅ <b>Данные получены!</b>\n\n"
-        "Нажмите /confirm для завершения или /cancel для отмены",
-        reply_markup=get_cancel_keyboard()
-    )
+    try:
+        data = await state.get_data()
+        service_name = data.get("selected_service")
+        if not service_name:
+            await state.clear()
+            await message.answer("❌ Сервис не выбран. Используйте /add и попробуйте снова.")
+            return
+
+        encrypted_key = security_service.encrypt(api_key)
+        await _save_service_for_user(
+            tg_id=message.from_user.id,
+            username=message.from_user.username,
+            service_name=service_name,
+            encrypted_key=encrypted_key,
+        )
+        await state.clear()
+
+        await message.answer(
+            f"✅ <b>Сервис добавлен!</b>\n\nСервис: {service_name.title()}"
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to process API key: {e}")
+        await message.answer("❌ Ошибка при сохранении API-ключа.")
 
 
-@router.message(F.text == "/confirm")
+@router.message(Command("confirm"))
 async def cmd_confirm(message: types.Message, state: FSMContext):
-    """Подтверждение добавления сервиса"""
     current_state = await state.get_state()
     
     if current_state != AddServiceStates.confirming.state:
-        await message.answer("❌ Нет активных процессов для подтверждения")
+        await message.answer("❌ Нет активных процессов для подтверждения.\nИспользуйте /add для начала.")
         return
     
-    # Получаем данные из состояния
     data = await state.get_data()
     service_name = data.get("selected_service")
     encrypted_key = data.get("api_key")
     tg_id = message.from_user.id
     
     if not all([service_name, encrypted_key]):
-        await message.answer("❌ Ошибка: недостаточно данных")
+        await message.answer("❌ Ошибка: недостаточно данных.\nПопробуйте /add еще раз.")
         await state.clear()
         return
     
-    # Сохраняем в БД
-    async with async_session_maker() as session:
-        # Находим пользователя
-        result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = result.scalar_one_or_none()
-        
-        if not user:
-            # Создаем нового пользователя
-            user = User(tg_id=tg_id, username=message.from_user.username)
-            session.add(user)
-            await session.flush()
-        
-        # Создаем сервис
-        service = Service(
-            user_id=user.id,
+    try:
+        await _save_service_for_user(
+            tg_id=tg_id,
+            username=message.from_user.username,
             service_name=service_name,
-            connection_type="api",
-            credentials={"api_key": encrypted_key},
-            is_active=True
+            encrypted_key=encrypted_key,
         )
-        session.add(service)
-        await session.commit()
+        await state.clear()
+        await message.answer(f"✅ <b>Сервис добавлен!</b>\n\nСервис: {service_name.title()}")
         
-        service_id = service.id
-    
-    await state.clear()
-    
-    await message.answer(
-        f"✅ <b>Сервис добавлен!</b>\n\n"
-        f"Сервис: {service_name.title()}\n"
-        f"ID: {service_id}\n\n"
-        "Используйте /status для проверки баланса"
-    )
+    except Exception as e:
+        logger.error(f"Failed to save service: {e}")
+        await message.answer("❌ Ошибка при сохранении в базу данных.")
 
 
-@router.message(F.text == "/cancel")
+@router.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
-    """Отмена текущего процесса"""
     await state.clear()
     await message.answer("❌ Операция отменена")

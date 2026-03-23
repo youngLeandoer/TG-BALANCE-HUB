@@ -26,7 +26,3 @@ class BaseAPIConnector(ABC):
     @abstractmethod
     async def get_balance_data(self) -> ServiceBalanceData:
         pass
-    
-    async def handle_rate_limit(self, retry_after: int):
-        import asyncio
-        await asyncio.sleep(retry_after)

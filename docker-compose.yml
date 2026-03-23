@@ -8,8 +8,10 @@ services:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data  # ✅ Исправлено: pgdata:/path
+      - pgdata:/var/lib/postgresql/data
     networks:
       - internal
     healthcheck:
@@ -44,7 +46,7 @@ services:
       - internal
     restart: unless-stopped
     volumes:
-      - ./src:/app/src:
+      - ./src:/app/src
 
   web:
     build:
@@ -64,7 +66,7 @@ services:
       - public
     restart: unless-stopped
     volumes:
-      - ./src:/app/src:ro
+      - ./src:/app/src
 
   worker:
     build:
@@ -81,10 +83,10 @@ services:
       - internal
     restart: unless-stopped
     volumes:
-      - ./src:/app/src:ro
+      - ./src:/app/src
 
 volumes:
-  pgdata:  # ✅ Исправлено: объявление именованного тома
+  pgdata:
 
 networks:
   internal:

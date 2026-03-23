@@ -3,12 +3,15 @@ import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.storage.redis import RedisStorage
+from redis.asyncio import from_url
 from src.core.config import settings
 from src.core.logger import setup_logger
 from src.database.init_db import init_db
-from src.database.session import async_session_maker
+
 from src.bot.handlers.add_service import router as add_service_router
+from src.bot.handlers.status import router as status_router
 
 logger = setup_logger(__name__)
 
@@ -27,18 +30,22 @@ async def main():
         token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
-    dp = Dispatcher()
+    
+    # ✅ Redis для FSM storage
+    redis = from_url(settings.REDIS_URL)
+    storage = RedisStorage(redis=redis)
+    
+    dp = Dispatcher(storage=storage)  # ✅ Передаём storage
     
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
     
-    # ✅ Создаем таблицы БД при старте
     await init_db()
     
-    # ✅ Регистрируем роутеры
+    # ✅ Роутеры ДО echo
     dp.include_router(add_service_router)
+    dp.include_router(status_router)
     
-    # Команда /start
     @dp.message(Command("start"))
     async def start_cmd(message: types.Message):
         await message.answer(
@@ -50,7 +57,6 @@ async def main():
             "/cancel — отменить операцию"
         )
     
-    # Команда /help
     @dp.message(Command("help"))
     async def help_cmd(message: types.Message):
         await message.answer(
@@ -62,17 +68,18 @@ async def main():
             "/cancel — отменить текущую операцию"
         )
     
-    # Команда /status (заглушка)
-    @dp.message(Command("status"))
-    async def status_cmd(message: types.Message):
-        await message.answer("📊 Статус сервисов в разработке...")
+    @dp.message(Command("cancel"))
+    async def cancel_cmd(message: types.Message, state):
+        from aiogram.fsm.context import FSMContext
+        await state.clear()
+        await message.answer("❌ Операция отменена")
     
-    # Хендлер на любое сообщение (заглушка)
-    @dp.message()
+    # ✅ Echo ТОЛЬКО для не-команд
+    @dp.message(StateFilter(None), F.text & ~F.text.startswith("/"))
     async def echo(message: types.Message):
         await message.answer(
-            f"👋 Используйте /add для добавления сервиса\n"
-            f"Или /help для справки"
+            "👋 Используйте /add для добавления сервиса\n"
+            "Или /help для справки"
         )
     
     logger.info("Starting polling...")

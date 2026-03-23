@@ -20,3 +20,7 @@ async def init_db():
     
     logger.info("✅ Database tables created successfully!")
     await engine.dispose()
+
+
+if __name__ == "__main__":
+    asyncio.run(init_db())
