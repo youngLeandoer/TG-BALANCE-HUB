@@ -59,9 +59,6 @@ class UmnicoConnector(BaseAPIConnector):
     async def get_balance_data(self) -> ServiceBalanceData:
         """Получение данных о балансе"""
         try:
-            # 🔍 Отладка: что у нас в credentials
-            logger.info(f"🔐 Raw credentials: {self.credentials}")
-            
             encrypted_key = self.credentials.get('api_key', '')
             logger.info(f"🔐 Encrypted key preview: {encrypted_key[:30] if encrypted_key else 'EMPTY'}...")
             try:

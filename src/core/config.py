@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     
     # Logging
     LOG_LEVEL: str = "INFO"
+    LOG_FILE_PATH: str = "/app/logs/bot.log"
+
+    # Mango Office scraping
+    MANGO_DASHBOARD_URL: str = "https://lk.mango-office.ru/"
+    MANGO_AUTH_URL: str = "https://lk.mango-office.ru/login"
+    MANGO_OTP_IMAP_HOST: str = ""
+    MANGO_OTP_IMAP_PORT: int = 993
+    MANGO_OTP_IMAP_USER: str = ""
+    MANGO_OTP_IMAP_PASSWORD: str = ""
+    MANGO_OTP_EMAIL_FROM: str = "order@dokatka.ru"
+    INTERNAL_UPDATE_TOKEN: str = ""
     
     @property
     def database_url(self) -> str:
