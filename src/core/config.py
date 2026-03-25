@@ -1,9 +1,10 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
 from functools import lru_cache
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
     # Bot
     BOT_TOKEN: str
     BOT_ADMINS: str
@@ -55,11 +56,6 @@ class Settings(BaseSettings):
     def admin_ids(self) -> List[int]:
         return [int(x.strip()) for x in self.BOT_ADMINS.split(",") if x.strip()]
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-
-
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()

@@ -14,6 +14,7 @@ from src.services.providers.hosterby import HosterByConnector
 from src.services.providers.smsaero import SMSAeroConnector
 from src.services.providers.avito import AvitoConnector
 from src.services.providers.regru import RegRuConnector
+from src.services.providers.wazzup import WazzupConnector
 
 logger = setup_logger(__name__)
 router = Router()
@@ -21,6 +22,7 @@ router = Router()
 SERVICE_CONNECTORS = {
     "umnico": UmnicoConnector,
     "avito": AvitoConnector,
+    "wazzup": WazzupConnector,
     "regru": RegRuConnector,
     "hosterby": HosterByConnector,
     "smsaero": SMSAeroConnector,
@@ -47,7 +49,27 @@ async def cmd_status(message: types.Message):
                 "Используйте /add для добавления"
             )
             return
-        
+
+        # Помечаем дубли (одинаковый service_name) как аккаунт N/M,
+        # чтобы в отчете было видно: это не баг, а несколько подключений.
+        service_totals: dict[str, int] = {}
+        for svc in user.services:
+            if not svc.is_active or svc.service_name == "mango_scraper":
+                continue
+            service_totals[svc.service_name] = service_totals.get(svc.service_name, 0) + 1
+        service_seen: dict[str, int] = {}
+
+        def build_service_title(service_name: str, label: str | None = None, base_title: str | None = None) -> str:
+            title = base_title or service_name.title()
+            if label:
+                return f"{title} ({label})"
+            total = service_totals.get(service_name, 1)
+            if total > 1:
+                current = service_seen.get(service_name, 0) + 1
+                service_seen[service_name] = current
+                return f"{title} (аккаунт {current}/{total})"
+            return title
+
         report = "📊 <b>Статус сервисов</b>\n\n"
         
         for service in user.services:
@@ -67,26 +89,43 @@ async def cmd_status(message: types.Message):
 
             except Exception as parse_error:
                 logger.error(f"Credentials parse failed: {parse_error}")
-                report += f"❌ <b>{service.service_name.title()}</b>\n"
+                service_title = build_service_title(service.service_name)
+                report += f"❌ <b>{service_title}</b>\n"
                 report += f"Ошибка чтения credentials: {str(parse_error)}\n\n"
                 continue
             
+            if service.service_name == "adminvps_scraper":
+                service_title = build_service_title(
+                    service.service_name,
+                    credentials.get("label"),
+                    base_title="AdminVPS",
+                )
+                if "manual_balance" in credentials:
+                    report += f"✅ <b>{service_title}</b>\n"
+                    report += (
+                        f"Баланс: {credentials.get('manual_balance')} "
+                        f"{credentials.get('manual_currency', 'RUB')}\n"
+                    )
+                    manual_updated_at = credentials.get("manual_updated_at")
+                    if manual_updated_at:
+                        report += f"Обновлено: {manual_updated_at}\n"
+                    report += "\n"
+                    service.last_check = datetime.utcnow()
+                else:
+                    report += f"⏳ <b>{service_title}</b>\n"
+                    report += (
+                        "Ожидаю баланс с вашего ПК: запустите "
+                        "<code>tools/adminvps_local_browser.py</code> "
+                        "(переменные <code>ADMINVPS_LOCAL_*</code>, <code>INTERNAL_UPDATE_TOKEN</code>).\n\n"
+                    )
+                continue
+
             connector_cls = SERVICE_CONNECTORS.get(service.service_name)
             if not connector_cls:
                 logger.warning(f"No connector for service id={service.id} name={service.service_name}")
-                report += f"❌ <b>{service.service_name.title()}</b>\n"
+                service_title = build_service_title(service.service_name, credentials.get("label"))
+                report += f"❌ <b>{service_title}</b>\n"
                 report += "Ошибка: сервис пока не поддерживается\n\n"
-                continue
-
-            # Local browser helper can push Mango balance snapshot via internal endpoint.
-            if service.service_name == "mango_scraper" and "manual_balance" in credentials:
-                service_title = service.service_name.title()
-                raw_label = credentials.get("label")
-                if raw_label:
-                    service_title = f"{service_title} ({raw_label})"
-                report += f"✅ <b>{service_title}</b>\n"
-                report += f"Баланс: {credentials.get('manual_balance')} {credentials.get('manual_currency', 'RUB')}\n\n"
-                service.last_check = datetime.utcnow()
                 continue
 
             logger.info(
@@ -98,34 +137,37 @@ async def cmd_status(message: types.Message):
                 balance_data = await asyncio.wait_for(connector.get_balance_data(), timeout=12.0)
             except asyncio.TimeoutError:
                 logger.warning(f"Service check timeout id={service.id} name={service.service_name}")
-                report += f"❌ <b>{service.service_name.title()}</b>\n"
+                service_title = build_service_title(service.service_name, credentials.get("label"))
+                report += f"❌ <b>{service_title}</b>\n"
                 report += "Ошибка: таймаут запроса к API сервиса(проблема со стороны сервиса)\n\n"
                 continue
             
             if balance_data.status == "OK":
-                service_title = service.service_name.title()
-                # Optional friendly account label for multi-account providers.
-                raw_label = credentials.get("label")
-                if not raw_label and service.service_name == "mango_scraper":
-                    raw_api_key = credentials.get("api_key", "")
-                    if isinstance(raw_api_key, str) and "|" in raw_api_key:
-                        # Backward compatibility for plaintext records.
-                        raw_label = raw_api_key.split("|", 1)[0].strip()
-                if raw_label:
-                    service_title = f"{service_title} ({raw_label})"
+                service_title = build_service_title(service.service_name, credentials.get("label"))
 
                 report += f"✅ <b>{service_title}</b>\n"
-                report += f"Баланс: {balance_data.balance} {balance_data.currency}\n"
+                if service.service_name == "wazzup":
+                    report += "Статус: API доступен\n"
+                    report += f"Активных каналов: {int(balance_data.balance)}\n"
+                    unpaid_channels = 0
+                    if (
+                        isinstance(balance_data.error_message, str)
+                        and balance_data.error_message.startswith("not_enough_money=")
+                    ):
+                        try:
+                            unpaid_channels = int(balance_data.error_message.split("=", 1)[1])
+                        except ValueError:
+                            unpaid_channels = 0
+                    report += f"Каналов с неоплатой: {unpaid_channels}\n"
+                else:
+                    report += f"Баланс: {balance_data.balance} {balance_data.currency}\n"
                 if balance_data.expiration:
                     expiration_dt = balance_data.expiration
                     if expiration_dt.tzinfo is not None:
                         expiration_dt = expiration_dt.astimezone().replace(tzinfo=None)
                     report += f"Оплатить до: {expiration_dt.strftime('%d.%m.%Y %H:%M')}\n"
             else:
-                service_title = service.service_name.title()
-                raw_label = credentials.get("label")
-                if raw_label:
-                    service_title = f"{service_title} ({raw_label})"
+                service_title = build_service_title(service.service_name, credentials.get("label"))
                 report += f"❌ <b>{service_title}</b>\n"
                 report += f"Ошибка: {balance_data.error_message}\n"
             

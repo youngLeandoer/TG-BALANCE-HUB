@@ -87,12 +87,28 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
             "Рекомендуется использовать API-пароль из настроек REG.RU.\n"
             "Для отмены: /cancel"
         )
+    elif service_name == "wazzup":
+        prompt = (
+            "🔑 <b>Введите API-ключ для Wazzup</b>\n\n"
+            "Формат: <code>api_key</code>\n"
+            "Ключ находится в Wazzup: Интеграция с CRM -> API -> Подключить.\n\n"
+            "Для отмены: /cancel"
+        )
     elif service_name == "mango_scraper":
         prompt = (
             "🔑 <b>Введите данные для Mango Office (scraper)</b>\n\n"
             "Формат: <code>label|login|password</code>\n"
             "Пример: <code>Mango Main|user@login.ru|password123</code>\n\n"
             "Добавьте второй аккаунт отдельным /add с другим label.\n"
+            "Для отмены: /cancel"
+        )
+    elif service_name == "adminvps_scraper":
+        prompt = (
+            "🔑 <b>AdminVPS — баланс с вашего ПК</b>\n\n"
+            "Формат: <code>label|login|password</code>\n"
+            "Пример: <code>Main|user@example.com|password123</code>\n\n"
+            "После добавления запускайте на своей машине "
+            "<code>tools/adminvps_local_browser.py</code> — баланс уйдёт на сервер бота.\n"
             "Для отмены: /cancel"
         )
     else:
@@ -129,7 +145,7 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
     # Базовая проверка: ключ не должен быть слишком коротким.
     # Для сервисов с составным форматом (email:key, login:password, user:client:secret)
     # ограничение по длине менее применимо.
-    if service_name not in {"smsaero", "avito", "regru"} and len(api_key) < 20:
+    if service_name not in {"smsaero", "avito", "regru", "wazzup", "adminvps_scraper"} and len(api_key) < 20:
         await message.answer(
             "❌ <b>Ключ слишком короткий!</b>\n\n"
             "Проверьте, что вы отправили полный API-ключ."
@@ -143,11 +159,22 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
                 f"Для {service_name.upper()} используйте формат: <code>login_or_email:api_key_or_password</code>"
             )
             return
-    
+
+    if service_name == "adminvps_scraper":
+        parts = api_key.split("|")
+        if len(parts) < 3 or not all(part.strip() for part in parts[:3]):
+            await message.answer(
+                "❌ <b>Неверный формат!</b>\n\n"
+                "Используйте: <code>label|login|password</code>"
+            )
+            return
+
     try:
         label = None
         if service_name == "mango_scraper":
             # For Mango scraper key format is label|login|password.
+            label = api_key.split("|", 1)[0].strip() if "|" in api_key else None
+        elif service_name == "adminvps_scraper":
             label = api_key.split("|", 1)[0].strip() if "|" in api_key else None
 
         encrypted_key = security_service.encrypt(api_key)
