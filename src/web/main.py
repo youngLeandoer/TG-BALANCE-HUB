@@ -3,7 +3,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from src.core.config import settings
-from src.database.models import User, Service
+from src.database.models import User, Service, BalanceHistory
 from src.database.session import async_session_maker
 
 app = FastAPI(title="Balance Hub OAuth")
@@ -75,6 +75,15 @@ async def _apply_manual_balance(
         credentials["manual_updated_at"] = datetime.utcnow().isoformat()
         target_service.credentials = credentials
         target_service.last_check = datetime.utcnow()
+        session.add(
+            BalanceHistory(
+                service_id=target_service.id,
+                balance=float(payload.balance),
+                currency=str(payload.currency),
+                status="OK",
+                checked_at=datetime.utcnow(),
+            )
+        )
         await session.commit()
 
     return {"status": "ok", "label": payload.label, "balance": payload.balance, "service": service_name}
@@ -86,6 +95,22 @@ async def update_adminvps_balance(
     x_internal_token: str | None = Header(default=None),
 ):
     return await _apply_manual_balance(payload, "adminvps_scraper", x_internal_token)
+
+
+@app.post("/internal/atlex/balance")
+async def update_atlex_balance(
+    payload: ManualBalanceUpdateRequest,
+    x_internal_token: str | None = Header(default=None),
+):
+    return await _apply_manual_balance(payload, "atlex_scraper", x_internal_token)
+
+
+@app.post("/internal/nic/balance")
+async def update_nic_balance(
+    payload: ManualBalanceUpdateRequest,
+    x_internal_token: str | None = Header(default=None),
+):
+    return await _apply_manual_balance(payload, "nic_scraper", x_internal_token)
 
 
 @app.post("/internal/mango/balance")

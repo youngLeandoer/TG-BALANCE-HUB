@@ -10,6 +10,8 @@ def get_services_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🇧🇾 Hoster.by", callback_data="add_service_hosterby")],
         [InlineKeyboardButton(text="✉️ SMS Aero", callback_data="add_service_smsaero")],
         [InlineKeyboardButton(text="🖥️ AdminVPS (локальный баланс)", callback_data="add_service_adminvps_scraper")],
+        [InlineKeyboardButton(text="🖥️ ATLEX (локальный баланс)", callback_data="add_service_atlex_scraper")],
+        [InlineKeyboardButton(text="🖥️ NIC.RU (локальный баланс)", callback_data="add_service_nic_scraper")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="add_service_cancel")],
     ])
     return keyboard

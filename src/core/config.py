@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_FILE_PATH: str = "/app/logs/bot.log"
+    APP_TIMEZONE: str = "Europe/Moscow"
 
     # Mango Office scraping
     MANGO_DASHBOARD_URL: str = "https://lk.mango-office.ru/"
@@ -44,6 +45,15 @@ class Settings(BaseSettings):
     MANGO_OTP_IMAP_PASSWORD: str = ""
     MANGO_OTP_EMAIL_FROM: str = "order@dokatka.ru"
     INTERNAL_UPDATE_TOKEN: str = ""
+
+    # Alerts & daily group report
+    LOW_BALANCE_THRESHOLD_RUB: float = 1000.0
+    DAILY_STATS_ENABLED: bool = False
+    DAILY_STATS_CHAT_ID: int = 0
+    DAILY_STATS_HOUR_UTC: int = 7
+    DAILY_STATS_MINUTE_UTC: int = 0
+    # If > 0, overrides daily schedule and sends report every N minutes (useful for testing).
+    DAILY_STATS_INTERVAL_MINUTES: int = 0
     
     @property
     def database_url(self) -> str:

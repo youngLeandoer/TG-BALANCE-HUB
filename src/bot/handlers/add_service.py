@@ -6,6 +6,7 @@ from sqlalchemy import select
 from src.database.models import User, Service
 from src.database.session import async_session_maker
 from src.bot.keyboards.services import get_services_keyboard, get_cancel_keyboard
+from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.bot.states.add_service import AddServiceStates
 from src.core.security import security_service
 from src.core.logger import setup_logger
@@ -44,6 +45,7 @@ async def _save_service_for_user(
 
 
 @router.message(Command("add"))
+@router.message(F.text == "➕ Добавить сервис")
 async def cmd_add(message: types.Message, state: FSMContext):
     await state.set_state(AddServiceStates.selecting_service)
     await message.answer(
@@ -59,6 +61,7 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
     if service_name == "cancel":
         await state.clear()
         await callback.message.edit_text("❌ Добавление сервиса отменено")
+        await callback.message.answer("Главное меню:", reply_markup=get_main_menu_keyboard())
         await callback.answer()
         return
     
@@ -111,6 +114,24 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
             "<code>tools/adminvps_local_browser.py</code> — баланс уйдёт на сервер бота.\n"
             "Для отмены: /cancel"
         )
+    elif service_name == "atlex_scraper":
+        prompt = (
+            "🔑 <b>ATLEX — баланс с вашего ПК</b>\n\n"
+            "Формат: <code>label|login|password</code>\n"
+            "Пример: <code>Main|user@example.com|password123</code>\n\n"
+            "После добавления запускайте на своей машине "
+            "<code>tools/atlex_local_browser.py</code> — баланс уйдёт на сервер бота.\n"
+            "Для отмены: /cancel"
+        )
+    elif service_name == "nic_scraper":
+        prompt = (
+            "🔑 <b>NIC.RU — баланс с вашего ПК</b>\n\n"
+            "Формат: <code>label|login|password</code>\n"
+            "Пример: <code>Main|user@example.com|password123</code>\n\n"
+            "После добавления запускайте на своей машине "
+            "<code>tools/nic_local_browser.py</code> — баланс уйдёт на сервер бота.\n"
+            "Для отмены: /cancel"
+        )
     else:
         prompt = (
             f"🔑 <b>Введите API-ключ для {service_name.title()}</b>\n\n"
@@ -145,7 +166,7 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
     # Базовая проверка: ключ не должен быть слишком коротким.
     # Для сервисов с составным форматом (email:key, login:password, user:client:secret)
     # ограничение по длине менее применимо.
-    if service_name not in {"smsaero", "avito", "regru", "wazzup", "adminvps_scraper"} and len(api_key) < 20:
+    if service_name not in {"smsaero", "avito", "regru", "wazzup", "adminvps_scraper", "atlex_scraper", "nic_scraper"} and len(api_key) < 20:
         await message.answer(
             "❌ <b>Ключ слишком короткий!</b>\n\n"
             "Проверьте, что вы отправили полный API-ключ."
@@ -160,7 +181,7 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
             )
             return
 
-    if service_name == "adminvps_scraper":
+    if service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
         parts = api_key.split("|")
         if len(parts) < 3 or not all(part.strip() for part in parts[:3]):
             await message.answer(
@@ -174,7 +195,7 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
         if service_name == "mango_scraper":
             # For Mango scraper key format is label|login|password.
             label = api_key.split("|", 1)[0].strip() if "|" in api_key else None
-        elif service_name == "adminvps_scraper":
+        elif service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
             label = api_key.split("|", 1)[0].strip() if "|" in api_key else None
 
         encrypted_key = security_service.encrypt(api_key)
@@ -188,7 +209,8 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
         await state.clear()
 
         await message.answer(
-            f"✅ <b>Сервис добавлен!</b>\n\nСервис: {service_name.title()}"
+            f"✅ <b>Сервис добавлен!</b>\n\nСервис: {service_name.title()}",
+            reply_markup=get_main_menu_keyboard(),
         )
 
     except Exception as e:
@@ -222,7 +244,10 @@ async def cmd_confirm(message: types.Message, state: FSMContext):
             encrypted_key=encrypted_key,
         )
         await state.clear()
-        await message.answer(f"✅ <b>Сервис добавлен!</b>\n\nСервис: {service_name.title()}")
+        await message.answer(
+            f"✅ <b>Сервис добавлен!</b>\n\nСервис: {service_name.title()}",
+            reply_markup=get_main_menu_keyboard(),
+        )
         
     except Exception as e:
         logger.error(f"Failed to save service: {e}")
@@ -230,6 +255,7 @@ async def cmd_confirm(message: types.Message, state: FSMContext):
 
 
 @router.message(Command("cancel"))
+@router.message(F.text == "❌ Отмена")
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Операция отменена")
+    await message.answer("❌ Операция отменена", reply_markup=get_main_menu_keyboard())

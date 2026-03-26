@@ -1,8 +1,18 @@
 import logging
 import sys
 import os
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from src.core.config import settings
+from src.core.timezone import app_tz
+
+
+class TZFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):  # noqa: N802
+        dt = datetime.fromtimestamp(record.created, tz=app_tz())
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
 
 
 def setup_logger(name: str) -> logging.Logger:
@@ -10,7 +20,7 @@ def setup_logger(name: str) -> logging.Logger:
     logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper()))
     
     if not logger.handlers:
-        formatter = logging.Formatter(
+        formatter = TZFormatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )

@@ -6,9 +6,12 @@ from datetime import datetime
 import json
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
-from src.database.models import User, Service
+from src.database.models import User, Service, BalanceHistory
 from src.database.session import async_session_maker
+from src.core.config import settings
 from src.core.logger import setup_logger
+from src.core.timezone import format_app_dt, parse_iso_as_utc, to_app_tz
+from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.services.providers.umnico import UmnicoConnector
 from src.services.providers.hosterby import HosterByConnector
 from src.services.providers.smsaero import SMSAeroConnector
@@ -18,6 +21,7 @@ from src.services.providers.wazzup import WazzupConnector
 
 logger = setup_logger(__name__)
 router = Router()
+CURRENCY_ALIASES = {"RUR": "RUB", "RUB": "RUB", "RUBLES": "RUB", "RUBLE": "RUB", "РУБ": "RUB"}
 
 SERVICE_CONNECTORS = {
     "umnico": UmnicoConnector,
@@ -29,7 +33,41 @@ SERVICE_CONNECTORS = {
 }
 
 
+def _record_balance_snapshot(
+    session,
+    *,
+    service_id: int,
+    balance: float,
+    currency: str,
+    status: str = "OK",
+) -> None:
+    session.add(
+        BalanceHistory(
+            service_id=service_id,
+            balance=balance,
+            currency=currency,
+            status=status,
+            checked_at=datetime.utcnow(),
+        )
+    )
+
+
+def _normalize_currency(raw: str | None) -> str:
+    value = (raw or "").strip().upper()
+    if not value:
+        return "UNK"
+    return CURRENCY_ALIASES.get(value, value)
+
+
+def _resolve_alert_threshold_rub(credentials: dict) -> float:
+    try:
+        return float(credentials.get("alert_threshold_rub", settings.LOW_BALANCE_THRESHOLD_RUB))
+    except (TypeError, ValueError):
+        return float(settings.LOW_BALANCE_THRESHOLD_RUB)
+
+
 @router.message(Command("status"))
+@router.message(F.text == "📊 Статус сервисов")
 async def cmd_status(message: types.Message):
     tg_id = message.from_user.id
     logger.info(f"/status requested by tg_id={tg_id}")
@@ -46,7 +84,8 @@ async def cmd_status(message: types.Message):
             await message.answer(
                 "📊 <b>Статус сервисов</b>\n\n"
                 "У вас пока нет добавленных сервисов.\n"
-                "Используйте /add для добавления"
+                "Используйте /add для добавления",
+                reply_markup=get_main_menu_keyboard(),
             )
             return
 
@@ -94,29 +133,59 @@ async def cmd_status(message: types.Message):
                 report += f"Ошибка чтения credentials: {str(parse_error)}\n\n"
                 continue
             
-            if service.service_name == "adminvps_scraper":
+            if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
+                base_title = (
+                    "AdminVPS"
+                    if service.service_name == "adminvps_scraper"
+                    else ("ATLEX" if service.service_name == "atlex_scraper" else "NIC.RU")
+                )
                 service_title = build_service_title(
                     service.service_name,
                     credentials.get("label"),
-                    base_title="AdminVPS",
+                    base_title=base_title,
                 )
                 if "manual_balance" in credentials:
+                    manual_balance = float(credentials.get("manual_balance", 0.0))
+                    manual_currency = str(credentials.get("manual_currency", "RUB"))
+                    threshold = _resolve_alert_threshold_rub(credentials)
                     report += f"✅ <b>{service_title}</b>\n"
                     report += (
-                        f"Баланс: {credentials.get('manual_balance')} "
-                        f"{credentials.get('manual_currency', 'RUB')}\n"
+                        f"Баланс: {manual_balance} "
+                        f"{manual_currency}\n"
                     )
+                    if _normalize_currency(manual_currency) == "RUB" and manual_balance <= threshold:
+                        report += f"⚠️ Ниже порога: {threshold:.2f} RUB\n"
                     manual_updated_at = credentials.get("manual_updated_at")
-                    if manual_updated_at:
-                        report += f"Обновлено: {manual_updated_at}\n"
+                    if isinstance(manual_updated_at, str) and manual_updated_at:
+                        parsed = parse_iso_as_utc(manual_updated_at)
+                        report += (
+                            f"Обновлено: {format_app_dt(parsed) if parsed else manual_updated_at}\n"
+                        )
                     report += "\n"
+                    _record_balance_snapshot(
+                        session,
+                        service_id=service.id,
+                        balance=manual_balance,
+                        currency=manual_currency,
+                        status="OK",
+                    )
                     service.last_check = datetime.utcnow()
                 else:
+                    helper = (
+                        "tools/adminvps_local_browser.py"
+                        if service.service_name == "adminvps_scraper"
+                        else ("tools/atlex_local_browser.py" if service.service_name == "atlex_scraper" else "tools/nic_local_browser.py")
+                    )
+                    env_prefix = (
+                        "ADMINVPS_LOCAL_*"
+                        if service.service_name == "adminvps_scraper"
+                        else ("ATLEX_LOCAL_*" if service.service_name == "atlex_scraper" else "NIC_LOCAL_*")
+                    )
                     report += f"⏳ <b>{service_title}</b>\n"
                     report += (
                         "Ожидаю баланс с вашего ПК: запустите "
-                        "<code>tools/adminvps_local_browser.py</code> "
-                        "(переменные <code>ADMINVPS_LOCAL_*</code>, <code>INTERNAL_UPDATE_TOKEN</code>).\n\n"
+                        f"<code>{helper}</code> "
+                        f"(переменные <code>{env_prefix}</code>, <code>INTERNAL_UPDATE_TOKEN</code>).\n\n"
                     )
                 continue
 
@@ -144,6 +213,7 @@ async def cmd_status(message: types.Message):
             
             if balance_data.status == "OK":
                 service_title = build_service_title(service.service_name, credentials.get("label"))
+                threshold = _resolve_alert_threshold_rub(credentials)
 
                 report += f"✅ <b>{service_title}</b>\n"
                 if service.service_name == "wazzup":
@@ -161,11 +231,21 @@ async def cmd_status(message: types.Message):
                     report += f"Каналов с неоплатой: {unpaid_channels}\n"
                 else:
                     report += f"Баланс: {balance_data.balance} {balance_data.currency}\n"
+                    if (
+                        _normalize_currency(balance_data.currency) == "RUB"
+                        and float(balance_data.balance) <= threshold
+                    ):
+                        report += f"⚠️ Ниже порога: {threshold:.2f} RUB\n"
                 if balance_data.expiration:
-                    expiration_dt = balance_data.expiration
-                    if expiration_dt.tzinfo is not None:
-                        expiration_dt = expiration_dt.astimezone().replace(tzinfo=None)
-                    report += f"Оплатить до: {expiration_dt.strftime('%d.%m.%Y %H:%M')}\n"
+                    expiration_dt = to_app_tz(balance_data.expiration)
+                    report += f"Оплатить до: {expiration_dt.strftime('%d.%m.%Y %H:%M %Z')}\n"
+                _record_balance_snapshot(
+                    session,
+                    service_id=service.id,
+                    balance=float(balance_data.balance),
+                    currency=str(balance_data.currency),
+                    status="OK",
+                )
             else:
                 service_title = build_service_title(service.service_name, credentials.get("label"))
                 report += f"❌ <b>{service_title}</b>\n"
@@ -175,4 +255,4 @@ async def cmd_status(message: types.Message):
             service.last_check = datetime.utcnow()
         
         await session.commit()
-        await message.answer(report)
+        await message.answer(report, reply_markup=get_main_menu_keyboard())

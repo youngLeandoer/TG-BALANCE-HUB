@@ -55,7 +55,7 @@ def safe_goto(page, url: str, timeout: int = 30000, attempts: int = 3) -> None:
         raise last_exc
 
 
-def run_browser(login: Optional[str], password: Optional[str], dashboard_url: str) -> float:
+def run_browser(login: Optional[str], password: Optional[str], dashboard_url: str, wait_login_seconds: int) -> float:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -82,7 +82,18 @@ def run_browser(login: Optional[str], password: Optional[str], dashboard_url: st
                     page.click(selector)
                     break
 
-        page.wait_for_timeout(15000)
+        # Avoid fixed sleeps; wait briefly for login/redirect, but allow manual steps.
+        deadline = time.time() + max(int(wait_login_seconds), 5)
+        while time.time() < deadline:
+            page.wait_for_timeout(600)
+            try:
+                content = page.content()
+            except Exception:
+                content = ""
+            # Heuristic: if we are not on login form anymore, proceed.
+            if ("password" not in content.lower()) and ("войти" not in content.lower()):
+                break
+
         safe_goto(page, dashboard_url, timeout=30000, attempts=3)
         content = page.content()
         browser.close()
@@ -137,6 +148,12 @@ def main() -> int:
     parser.add_argument("--base-url", default=os.getenv("ADMINVPS_LOCAL_BASE_URL", "http://localhost:8000"))
     parser.add_argument("--dashboard-url", default=os.getenv("ADMINVPS_DASHBOARD_URL", "https://my.adminvps.ru/"))
     parser.add_argument("--currency", default=os.getenv("ADMINVPS_LOCAL_CURRENCY", "RUB"))
+    parser.add_argument(
+        "--wait-login-seconds",
+        type=int,
+        default=int(os.getenv("ADMINVPS_WAIT_LOGIN_SECONDS", "20")),
+        help="Seconds to wait for login/redirect (manual steps/captcha).",
+    )
     parser.add_argument("--login", default=os.getenv("ADMINVPS_LOCAL_LOGIN"))
     parser.add_argument("--password", default=os.getenv("ADMINVPS_LOCAL_PASSWORD"))
     args = parser.parse_args()
@@ -148,7 +165,7 @@ def main() -> int:
     if not args.login or not args.password:
         raise RuntimeError("Set ADMINVPS_LOCAL_LOGIN/ADMINVPS_LOCAL_PASSWORD in .env or pass --login/--password")
 
-    balance = run_browser(args.login, args.password, args.dashboard_url)
+    balance = run_browser(args.login, args.password, args.dashboard_url, args.wait_login_seconds)
     push_balance(args.base_url, args.internal_token, args.tg_id, args.label, balance, args.currency)
     print(f"Balance pushed: {balance} {args.currency} for {args.label}")
     return 0
