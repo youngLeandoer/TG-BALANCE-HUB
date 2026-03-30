@@ -97,6 +97,13 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
             "Ключ находится в Wazzup: Интеграция с CRM -> API -> Подключить.\n\n"
             "Для отмены: /cancel"
         )
+    elif service_name == "timewebcloud":
+        prompt = (
+            "🔑 <b>Введите API-токен Timeweb Cloud</b>\n\n"
+            "Формат: <code>token</code>\n"
+            "Токен создаётся в Timeweb Cloud: API и Terraform -> Добавить токен.\n\n"
+            "Для отмены: /cancel"
+        )
     elif service_name == "mango_scraper":
         prompt = (
             "🔑 <b>Введите данные для Mango Office (scraper)</b>\n\n"
