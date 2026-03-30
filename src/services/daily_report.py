@@ -4,6 +4,7 @@ from collections import defaultdict
 import asyncio
 from datetime import datetime, timedelta
 import json
+import html
 
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -72,6 +73,17 @@ def _threshold_rub(credentials: dict) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(settings.LOW_BALANCE_THRESHOLD_RUB)
+
+
+def _safe_text(value: object) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def _fmt_amount(value: float) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except Exception:
+        return _safe_text(value)
 
 
 def _record_snapshot(session, service_id: int, balance: float, currency: str, status: str = "OK") -> None:
@@ -179,7 +191,7 @@ async def build_daily_group_report() -> str:
 
     totals_by_currency = defaultdict(lambda: {"spend": 0.0, "topup": 0.0})
     low_balance_alerts: list[str] = []
-    user_lines: dict[int, list[str]] = defaultdict(list)
+    user_blocks: dict[int, list[str]] = defaultdict(list)
 
     totals_per_user_service = defaultdict(int)
     for user, service, _ in services:
@@ -196,7 +208,7 @@ async def build_daily_group_report() -> str:
         )
         service_rows = rows_by_service.get(service.id, [])
         if not service_rows:
-            user_lines[user.id].append(f"• {title}: нет замеров за 24ч")
+            user_blocks[user.id].append(f"• {title}: <i>нет замеров за 24ч</i>")
             continue
 
         last = service_rows[-1]
@@ -211,8 +223,11 @@ async def build_daily_group_report() -> str:
                     topup += delta
 
             currency = _normalize_currency(last.currency)
-            user_lines[user.id].append(
-                f"• {title}: {float(last.balance):.2f} {currency} | расход {spend:.2f} | пополнения {topup:.2f}"
+            user_blocks[user.id].append(
+                "• "
+                f"<b>{title}</b>\n"
+                f"  Баланс: <code>{_fmt_amount(last.balance)} {currency}</code>\n"
+                f"  Расход: <code>{spend:.2f}</code> | Пополнения: <code>{topup:.2f}</code>"
             )
             totals_by_currency[currency]["spend"] += spend
             totals_by_currency[currency]["topup"] += topup
@@ -220,14 +235,16 @@ async def build_daily_group_report() -> str:
             threshold = _threshold_rub(credentials)
             if currency == "RUB" and float(last.balance) <= threshold:
                 low_balance_alerts.append(
-                    f"⚠️ {title}: {float(last.balance):.2f} RUB (порог {threshold:.2f})"
+                    f"⚠️ <b>{_safe_text(title)}</b>: <code>{_fmt_amount(last.balance)} RUB</code> (порог <code>{threshold:.2f}</code>)"
                 )
         else:
             diff = 0.0
             if len(service_rows) >= 2:
                 diff = float(service_rows[-1].balance) - float(service_rows[0].balance)
-            user_lines[user.id].append(
-                f"• {title}: активные каналы {int(last.balance)} (изменение {diff:+.0f})"
+            user_blocks[user.id].append(
+                "• "
+                f"<b>{title}</b>\n"
+                f"  Активные каналы: <b>{int(last.balance)}</b> (изменение <code>{diff:+.0f}</code>)"
             )
 
     report = (
@@ -237,11 +254,11 @@ async def build_daily_group_report() -> str:
     )
 
     for user in users:
-        lines = user_lines.get(user.id)
-        if not lines:
+        blocks = user_blocks.get(user.id)
+        if not blocks:
             continue
         uname = f"@{user.username}" if user.username else f"tg_id={user.tg_id}"
-        report += f"<b>👤 {uname}</b>\n" + "\n".join(lines) + "\n\n"
+        report += f"<b>👤 {uname}</b>\n" + "\n\n".join(blocks) + "\n\n"
 
     report += "<b>Итого по валютам</b>\n"
     if not totals_by_currency:
