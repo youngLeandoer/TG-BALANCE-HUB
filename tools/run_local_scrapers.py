@@ -38,8 +38,8 @@ def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
-def _run_one(spec: ScraperSpec, *, python: str, extra_args: list[str]) -> int:
-    cmd = [python, os.path.join(_repo_root(), spec.script_rel_path), *extra_args]
+def _run_one(spec: ScraperSpec, *, python: str, extra_args: list[str], common_args: list[str]) -> int:
+    cmd = [python, os.path.join(_repo_root(), spec.script_rel_path), *common_args, *extra_args]
     print(f"\n=== Running {spec.key} ===")
     print("Command:", " ".join(cmd))
     proc = subprocess.run(cmd)
@@ -59,6 +59,37 @@ def main() -> int:
         "--python",
         default=sys.executable,
         help="Python interpreter to use (default: current interpreter)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default="",
+        help="Override Balance Hub base URL for all scrapers (e.g. https://<domain>/balance-hub)",
+    )
+    parser.add_argument(
+        "--internal-token",
+        default="",
+        help="Override INTERNAL_UPDATE_TOKEN for all scrapers",
+    )
+    parser.add_argument(
+        "--tg-id",
+        type=int,
+        default=0,
+        help="Override *LOCAL_TG_ID for all scrapers",
+    )
+    parser.add_argument(
+        "--label",
+        default="",
+        help="Override *LOCAL_LABEL for all scrapers",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Ask scrapers to run headless (if supported by the scraper script)",
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Ask scrapers to run headed (if supported by the scraper script)",
     )
     parser.add_argument(
         "--",
@@ -84,9 +115,25 @@ def main() -> int:
     if extra_args[:1] == ["--"]:
         extra_args = extra_args[1:]
 
+    common_args: list[str] = []
+    if args.base_url.strip():
+        common_args += ["--base-url", args.base_url.strip()]
+    if args.internal_token.strip():
+        common_args += ["--internal-token", args.internal_token.strip()]
+    if args.tg_id:
+        common_args += ["--tg-id", str(args.tg_id)]
+    if args.label.strip():
+        common_args += ["--label", args.label.strip()]
+    if args.headless and args.headed:
+        raise SystemExit("Pass only one: --headless or --headed")
+    if args.headless:
+        common_args += ["--headless"]
+    if args.headed:
+        common_args += ["--headed"]
+
     failures: list[tuple[str, int]] = []
     for key in selected:
-        rc = _run_one(SCRAPERS[key], python=args.python, extra_args=extra_args)
+        rc = _run_one(SCRAPERS[key], python=args.python, extra_args=extra_args, common_args=common_args)
         if rc != 0:
             failures.append((key, rc))
 

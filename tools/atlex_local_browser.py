@@ -176,8 +176,8 @@ def run_browser(
         ) from exc
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
+        browser = p.chromium.launch(headless=bool(os.getenv("PLAYWRIGHT_HEADLESS", "") == "1"))
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
         safe_goto(page, dashboard_url, timeout=30000, attempts=3)
 
         if login and password:
@@ -343,9 +343,18 @@ def main() -> int:
         default=int(os.getenv("ATLEX_WAIT_LOGIN_SECONDS", "90")),
         help="Seconds to wait for manual/captcha/OTP during login flow.",
     )
+    parser.add_argument("--headless", action="store_true", help="Run browser headless (no X server needed)")
+    parser.add_argument("--headed", action="store_true", help="Run browser with UI (requires X server)")
     parser.add_argument("--login", default=os.getenv("ATLEX_LOCAL_LOGIN"))
     parser.add_argument("--password", default=os.getenv("ATLEX_LOCAL_PASSWORD"))
     args = parser.parse_args()
+
+    if args.headless and args.headed:
+        raise RuntimeError("Pass only one: --headless or --headed")
+    if args.headless:
+        os.environ["PLAYWRIGHT_HEADLESS"] = "1"
+    if args.headed:
+        os.environ["PLAYWRIGHT_HEADLESS"] = "0"
 
     if not args.tg_id:
         raise RuntimeError("Set ATLEX_LOCAL_TG_ID in .env or pass --tg-id")

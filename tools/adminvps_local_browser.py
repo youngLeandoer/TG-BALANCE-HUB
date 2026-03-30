@@ -64,8 +64,8 @@ def run_browser(login: Optional[str], password: Optional[str], dashboard_url: st
         ) from exc
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
+        browser = p.chromium.launch(headless=bool(os.getenv("PLAYWRIGHT_HEADLESS", "") == "1"))
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
         safe_goto(page, dashboard_url, timeout=30000, attempts=3)
 
         if login and password:
@@ -154,9 +154,18 @@ def main() -> int:
         default=int(os.getenv("ADMINVPS_WAIT_LOGIN_SECONDS", "20")),
         help="Seconds to wait for login/redirect (manual steps/captcha).",
     )
+    parser.add_argument("--headless", action="store_true", help="Run browser headless (no X server needed)")
+    parser.add_argument("--headed", action="store_true", help="Run browser with UI (requires X server)")
     parser.add_argument("--login", default=os.getenv("ADMINVPS_LOCAL_LOGIN"))
     parser.add_argument("--password", default=os.getenv("ADMINVPS_LOCAL_PASSWORD"))
     args = parser.parse_args()
+
+    if args.headless and args.headed:
+        raise RuntimeError("Pass only one: --headless or --headed")
+    if args.headless:
+        os.environ["PLAYWRIGHT_HEADLESS"] = "1"
+    if args.headed:
+        os.environ["PLAYWRIGHT_HEADLESS"] = "0"
 
     if not args.tg_id:
         raise RuntimeError("Set ADMINVPS_LOCAL_TG_ID in .env or pass --tg-id")
