@@ -10,6 +10,8 @@ services:
       POSTGRES_DB: ${DB_NAME}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
     networks:
       - internal
     restart: unless-stopped
@@ -54,8 +56,6 @@ services:
       dockerfile: Dockerfile.web
     container_name: balance_hub_web
     env_file: .env
-    ports:
-      - "${WEB_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -63,7 +63,7 @@ services:
         condition: service_healthy
     networks:
       - internal
-      - public
+      - shared-network
     restart: unless-stopped
 
   worker:
@@ -90,5 +90,6 @@ volumes:
 networks:
   internal:
     driver: bridge
-  public:
-    driver: bridge
+  shared-network:
+    external: true
+    name: shared-network
