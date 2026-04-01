@@ -20,6 +20,7 @@ from src.services.providers.avito import AvitoConnector
 from src.services.providers.regru import RegRuConnector
 from src.services.providers.wazzup import WazzupConnector
 from src.services.providers.timewebcloud import TimewebCloudConnector
+from src.services.providers.selectel import SelectelConnector
 
 logger = setup_logger(__name__)
 router = Router()
@@ -33,6 +34,7 @@ SERVICE_CONNECTORS = {
     "hosterby": HosterByConnector,
     "smsaero": SMSAeroConnector,
     "timewebcloud": TimewebCloudConnector,
+    "selectel": SelectelConnector,
 }
 
 

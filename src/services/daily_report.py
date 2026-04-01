@@ -21,6 +21,7 @@ from src.services.providers.smsaero import SMSAeroConnector
 from src.services.providers.umnico import UmnicoConnector
 from src.services.providers.wazzup import WazzupConnector
 from src.services.providers.timewebcloud import TimewebCloudConnector
+from src.services.providers.selectel import SelectelConnector
 
 logger = setup_logger(__name__)
 
@@ -34,6 +35,7 @@ SERVICE_CONNECTORS = {
     "hosterby": HosterByConnector,
     "smsaero": SMSAeroConnector,
     "timewebcloud": TimewebCloudConnector,
+    "selectel": SelectelConnector,
 }
 
 

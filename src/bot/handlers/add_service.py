@@ -104,6 +104,15 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
             "Токен создаётся в Timeweb Cloud: API и Terraform -> Добавить токен.\n\n"
             "Для отмены: /cancel"
         )
+    elif service_name == "selectel":
+        prompt = (
+            "🔑 <b>Введите токен Selectel</b>\n\n"
+            "Формат: <code>token</code>\n\n"
+            "Рекомендуется использовать <b>статический токен</b> из панели Selectel:\n"
+            "Account → Access → API Keys → Add Key.\n"
+            "Также поддерживается IAM-токен (X-Auth-Token).\n\n"
+            "Для отмены: /cancel"
+        )
     elif service_name == "mango_scraper":
         prompt = (
             "🔑 <b>Введите данные для Mango Office (scraper)</b>\n\n"
