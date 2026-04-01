@@ -46,6 +46,14 @@ class Settings(BaseSettings):
     MANGO_OTP_EMAIL_FROM: str = "order@dokatka.ru"
     INTERNAL_UPDATE_TOKEN: str = ""
 
+    # Optional: run local Playwright scrapers on the server
+    # to push manual balances via internal endpoints before building reports.
+    LOCAL_SCRAPERS_ENABLED: bool = False
+    # Base URL where FastAPI web is reachable (may include path prefix, e.g. https://<domain>/balance-hub)
+    LOCAL_SCRAPERS_BASE_URL: str = ""
+    # Optional: comma-separated subset, e.g. "adminvps,atlex,nic" (empty = all)
+    LOCAL_SCRAPERS_ONLY: str = ""
+
     # Alerts & daily group report
     LOW_BALANCE_THRESHOLD_RUB: float = 1000.0
     DAILY_STATS_ENABLED: bool = False

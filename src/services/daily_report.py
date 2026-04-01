@@ -22,6 +22,7 @@ from src.services.providers.umnico import UmnicoConnector
 from src.services.providers.wazzup import WazzupConnector
 from src.services.providers.timewebcloud import TimewebCloudConnector
 from src.services.providers.selectel import SelectelConnector
+from src.services.local_scrapers import run_local_scrapers_if_enabled
 
 logger = setup_logger(__name__)
 
@@ -105,6 +106,11 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
     Pull fresh balances before building report so group gets up-to-date data.
     Mirrors /status behavior but without sending per-service messages.
     """
+    # If local Playwright scrapers are configured to run on the server,
+    # run them once before hitting API providers so their pushed snapshots
+    # are included in the final aggregated report.
+    await run_local_scrapers_if_enabled(reason="daily_report_pre_refresh")
+
     async with async_session_maker() as session:
         for _, service, credentials in services:
             if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:

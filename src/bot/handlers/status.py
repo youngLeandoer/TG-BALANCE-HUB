@@ -21,6 +21,7 @@ from src.services.providers.regru import RegRuConnector
 from src.services.providers.wazzup import WazzupConnector
 from src.services.providers.timewebcloud import TimewebCloudConnector
 from src.services.providers.selectel import SelectelConnector
+from src.services.local_scrapers import run_local_scrapers_if_enabled
 
 logger = setup_logger(__name__)
 router = Router()
@@ -88,6 +89,15 @@ async def cmd_status(message: types.Message):
     tg_id = message.from_user.id
     logger.info(f"/status requested by tg_id={tg_id}")
     
+    # Optionally run local Playwright scrapers before building status,
+    # so the report includes fresh pushed balances (adminvps/atlex/nic) too.
+    try:
+        await asyncio.wait_for(run_local_scrapers_if_enabled(reason="status_command"), timeout=180.0)
+    except asyncio.TimeoutError:
+        logger.warning("Local scrapers timed out for /status (tg_id=%s)", tg_id)
+    except Exception as exc:
+        logger.warning("Local scrapers failed for /status (tg_id=%s): %s", tg_id, exc)
+
     async with async_session_maker() as session:
         result = await session.execute(
             select(User)

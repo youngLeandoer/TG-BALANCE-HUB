@@ -17,6 +17,9 @@ redis>=5.0.1
 # HTTP Client
 httpx>=0.26.0
 
+# Local browser scrapers (optional)
+playwright>=1.45.0
+
 # Settings & Validation
 pydantic>=2.5.3
 pydantic-settings>=2.1.0
