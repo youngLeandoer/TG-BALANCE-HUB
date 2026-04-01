@@ -9,6 +9,7 @@ def get_main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🗂 Статистика (всё время)")],
             [KeyboardButton(text="📤 Экспорт CSV (3 дня)"), KeyboardButton(text="📤 Экспорт CSV (месяц)")],
             [KeyboardButton(text="📤 Экспорт CSV (всё время)")],
+            [KeyboardButton(text="ℹ️ Help")],
             [KeyboardButton(text="🩺 Healthcheck")],
             [KeyboardButton(text="❌ Отмена")],
         ],

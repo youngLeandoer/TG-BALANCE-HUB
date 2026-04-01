@@ -32,6 +32,7 @@ MAIN_MENU_BUTTONS = (
     "📤 Экспорт CSV (3 дня)",
     "📤 Экспорт CSV (месяц)",
     "📤 Экспорт CSV (всё время)",
+    "ℹ️ Help",
     "🩺 Healthcheck",
     "❌ Отмена",
 )
@@ -141,6 +142,7 @@ async def main():
         )
     
     @dp.message(Command("help"))
+    @dp.message(F.text == "ℹ️ Help")
     async def help_cmd(message: types.Message):
         await message.answer(
             "📚 <b>Справка</b>\n\n"

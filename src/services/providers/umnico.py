@@ -1,4 +1,5 @@
 import httpx
+import json
 from typing import Optional
 from datetime import datetime
 from src.services.base import BaseAPIConnector, ServiceBalanceData
@@ -16,6 +17,7 @@ class UmnicoConnector(BaseAPIConnector):
     
     # ✅ URL без пробелов в конце!
     API_URL = "https://api.umnico.com/v1.3/account/me/tariff"
+    INTEGRATIONS_URL = "https://api.umnico.com/v1.3/integrations"
 
     def _resolve_api_key(self) -> str:
         encrypted_key = self.credentials.get('api_key', '')
@@ -32,6 +34,14 @@ class UmnicoConnector(BaseAPIConnector):
         for token in (api_key, f"Bearer {api_key}"):
             headers = self._get_headers(token)
             response = await client.get(self.API_URL, headers=headers)
+            if response.status_code != 401:
+                return response
+        return response
+
+    async def _request_integrations(self, client: httpx.AsyncClient, api_key: str) -> httpx.Response:
+        for token in (api_key, f"Bearer {api_key}"):
+            headers = self._get_headers(token)
+            response = await client.get(self.INTEGRATIONS_URL, headers=headers)
             if response.status_code != 401:
                 return response
         return response
@@ -101,12 +111,63 @@ class UmnicoConnector(BaseAPIConnector):
                         pass
                 
                 logger.info(f"✅ Balance parsed: {balance} {currency}")
+
+                # Also fetch integration channel statuses (active/inactive channels).
+                channels_active = None
+                channels_total = None
+                active_channels: list[str] = []
+                inactive_channels: list[str] = []
+                try:
+                    integrations_resp = await self._request_integrations(client, api_key)
+                    integrations_resp.raise_for_status()
+                    integrations = integrations_resp.json()
+                    if isinstance(integrations, list):
+                        channels_total = len(integrations)
+                        channels_active = 0
+                        for item in integrations:
+                            if not isinstance(item, dict):
+                                continue
+                            status = (item.get("status") or "").strip()
+                            itype = (item.get("type") or "").strip()
+                            login = (item.get("login") or "").strip()
+                            label = ""
+                            if itype and login:
+                                label = f"{itype}:{login}"
+                            elif login:
+                                label = login
+                            elif itype:
+                                label = itype
+
+                            if status == "active":
+                                channels_active += 1
+                                if label:
+                                    active_channels.append(label)
+                            else:
+                                if label:
+                                    inactive_channels.append(f"{label} ({status or 'unknown'})")
+                except Exception as exc:
+                    logger.warning(f"Umnico integrations fetch failed: {type(exc).__name__}: {exc}")
                 
                 return ServiceBalanceData(
                     balance=balance,
                     currency=currency,
                     expiration=expiration,
-                    status="OK"
+                    status="OK",
+                    error_message=(
+                        json.dumps(
+                            {
+                                "channels_active": channels_active,
+                                "channels_total": channels_total,
+                                "active_channels": active_channels[:10],
+                                "active_channels_more": max(len(active_channels) - 10, 0),
+                                "inactive_channels": inactive_channels[:10],
+                                "inactive_channels_more": max(len(inactive_channels) - 10, 0),
+                            },
+                            ensure_ascii=False,
+                        )
+                        if channels_active is not None and channels_total is not None
+                        else None
+                    ),
                 )
                 
         except httpx.HTTPStatusError as e:
