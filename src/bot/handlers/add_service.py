@@ -104,6 +104,24 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
             "Токен создаётся в Timeweb Cloud: API и Terraform -> Добавить токен.\n\n"
             "Для отмены: /cancel"
         )
+    elif service_name == "yandex_cloud":
+        prompt = (
+            "🔑 <b>Введите данные для Yandex Cloud</b>\n\n"
+            "Формат: <code>billing_account_id:token</code>\n"
+            "Пример: <code>aje0kq...:t1.9e...</code>\n\n"
+            "Где взять:\n"
+            "- <b>billing_account_id</b>: в кабинете Yandex Cloud → Billing → Account.\n"
+            "- <b>token</b>: IAM-токен или OAuth-токен (будет отправляться как <code>Authorization: Bearer ...</code>).\n\n"
+            "Для отмены: /cancel"
+        )
+    elif service_name == "yandex_geocoder":
+        prompt = (
+            "🔑 <b>Введите API-ключ Yandex Geocoder</b>\n\n"
+            "Формат: <code>api_key</code>\n\n"
+            "Ключ создаётся в кабинете Яндекс-разработчика (Maps → Geocoder).\n"
+            "Активация ключа может занять до 15 минут.\n\n"
+            "Для отмены: /cancel"
+        )
     elif service_name == "selectel":
         prompt = (
             "🔑 <b>Введите токен Selectel</b>\n\n"
@@ -194,6 +212,14 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
             await message.answer(
                 "❌ <b>Неверный формат ключа!</b>\n\n"
                 f"Для {service_name.upper()} используйте формат: <code>login_or_email:api_key_or_password</code>"
+            )
+            return
+
+    if service_name == "yandex_cloud":
+        if ":" not in api_key or not all(part.strip() for part in api_key.split(":", 1)):
+            await message.answer(
+                "❌ <b>Неверный формат ключа!</b>\n\n"
+                "Для Yandex Cloud используйте формат: <code>billing_account_id:token</code>"
             )
             return
 

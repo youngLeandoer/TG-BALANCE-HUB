@@ -22,6 +22,8 @@ from src.services.providers.wazzup import WazzupConnector
 from src.services.providers.timewebcloud import TimewebCloudConnector
 from src.services.providers.selectel import SelectelConnector
 from src.services.local_scrapers import run_local_scrapers_if_enabled
+from src.services.providers.yandex_cloud import YandexCloudConnector
+from src.services.providers.yandex_geocoder import YandexGeocoderConnector
 
 logger = setup_logger(__name__)
 router = Router()
@@ -36,6 +38,8 @@ SERVICE_CONNECTORS = {
     "smsaero": SMSAeroConnector,
     "timewebcloud": TimewebCloudConnector,
     "selectel": SelectelConnector,
+    "yandex_cloud": YandexCloudConnector,
+    "yandex_geocoder": YandexGeocoderConnector,
 }
 
 

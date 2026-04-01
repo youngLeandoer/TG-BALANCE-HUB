@@ -20,7 +20,7 @@ from src.database.session import async_session_maker
 logger = setup_logger(__name__)
 router = Router()
 
-NON_MONETARY_SERVICES = {"wazzup"}
+NON_MONETARY_SERVICES = {"wazzup", "yandex_geocoder"}
 CURRENCY_ALIASES = {
     "RUB": "RUB",
     "RUR": "RUB",
