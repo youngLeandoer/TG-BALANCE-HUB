@@ -26,3 +26,13 @@ class BaseAPIConnector(ABC):
     @abstractmethod
     async def get_balance_data(self) -> ServiceBalanceData:
         pass
+
+
+def connector_wait_timeout_seconds(service_name: str) -> float:
+    """
+    Upper bound for asyncio.wait_for around get_balance_data().
+    Some providers need two sequential HTTP calls or retry several auth variants.
+    """
+    if service_name == "hosterby":
+        return 40.0
+    return 12.0

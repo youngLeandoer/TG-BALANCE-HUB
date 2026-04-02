@@ -13,6 +13,7 @@ from src.core.config import settings
 from src.core.logger import setup_logger
 from src.core.timezone import format_app_dt
 from src.database.models import BalanceHistory, Service, User
+from src.services.base import connector_wait_timeout_seconds
 from src.database.session import async_session_maker
 from src.services.providers.avito import AvitoConnector
 from src.services.providers.hosterby import HosterByConnector
@@ -132,7 +133,10 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
                 continue
             try:
                 connector = connector_cls(credentials=credentials)
-                balance_data = await asyncio.wait_for(connector.get_balance_data(), timeout=12.0)
+                balance_data = await asyncio.wait_for(
+                    connector.get_balance_data(),
+                    timeout=connector_wait_timeout_seconds(service.service_name),
+                )
                 if balance_data.status == "OK":
                     _record_snapshot(
                         session,

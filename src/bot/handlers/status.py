@@ -8,6 +8,7 @@ import html
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from src.database.models import User, Service, BalanceHistory
+from src.services.base import connector_wait_timeout_seconds
 from src.database.session import async_session_maker
 from src.core.config import settings
 from src.core.logger import setup_logger
@@ -248,7 +249,10 @@ async def cmd_status(message: types.Message):
             connector = connector_cls(credentials=credentials)
             try:
                 # Один проблемный провайдер не должен подвешивать весь /status.
-                balance_data = await asyncio.wait_for(connector.get_balance_data(), timeout=12.0)
+                balance_data = await asyncio.wait_for(
+                    connector.get_balance_data(),
+                    timeout=connector_wait_timeout_seconds(service.service_name),
+                )
             except asyncio.TimeoutError:
                 logger.warning(f"Service check timeout id={service.id} name={service.service_name}")
                 service_title = build_service_title(service.service_name, credentials.get("label"))

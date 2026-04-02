@@ -97,6 +97,21 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
             "Ключ находится в Wazzup: Интеграция с CRM -> API -> Подключить.\n\n"
             "Для отмены: /cancel"
         )
+    elif service_name == "hosterby":
+        prompt = (
+            "🔑 <b>Hoster.by — нужен JWT access token</b>\n\n"
+            "В журнале ключей у вас <b>Access Key</b> и <b>Secret Key</b> — "
+            "их <b>нельзя</b> вставлять в бот как один токен.\n\n"
+            "Сделайте так:\n"
+            "1) Откройте "
+            "<a href=\"https://serviceapi.hoster.by/rest_api_docs.html\">документацию API</a>.\n"
+            "2) Найдите группу <b>ServiceAccount</b> → запрос "
+            "<b>Create service-account tokens</b> (создание токенов по ключам).\n"
+            "3) Скопируйте из ответа <b>access token</b> — длинная строка, обычно начинается с "
+            "<code>eyJ</code> (это JWT).\n\n"
+            "Дальше: вставьте сюда <b>только этот access token</b>.\n\n"
+            "Для отмены: /cancel"
+        )
     elif service_name == "timewebcloud":
         prompt = (
             "🔑 <b>Введите API-токен Timeweb Cloud</b>\n\n"

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 import csv
 from datetime import datetime, timedelta
+import html
 import io
 import json
 
@@ -32,6 +33,31 @@ CURRENCY_ALIASES = {
 }
 
 
+def _safe_text(value: object) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def _fmt_money(amount: float) -> str:
+    try:
+        return f"{float(amount):,.2f}".replace(",", " ")
+    except Exception:
+        return _safe_text(amount)
+
+
+def _display_base(service_name: str) -> str:
+    special = {
+        "yandex_geocoder": "Yandex Geocoder",
+        "yandex_cloud": "Yandex Cloud",
+        "timewebcloud": "Timeweb Cloud",
+        "hosterby": "Hoster.by",
+    }
+    if service_name in special:
+        return special[service_name]
+    if "_" in service_name:
+        return " ".join(p.capitalize() for p in service_name.split("_"))
+    return service_name.title()
+
+
 def _service_title(service: Service, *, index: int, total: int) -> str:
     if service.service_name == "adminvps_scraper":
         base = "AdminVPS"
@@ -40,7 +66,7 @@ def _service_title(service: Service, *, index: int, total: int) -> str:
     elif service.service_name == "nic_scraper":
         base = "NIC.RU"
     else:
-        base = service.service_name.title()
+        base = _display_base(service.service_name)
     credentials = service.credentials or {}
     if isinstance(credentials, str):
         try:
@@ -151,14 +177,17 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
         rows_by_service[row.service_id].append(row)
 
     totals_by_currency = defaultdict(lambda: {"spend": 0.0, "topup": 0.0})
-    report = f"📉 <b>Финансовая статистика</b>\nПериод: <b>{period_title}</b>\n\n"
+    blocks: list[str] = [
+        "📉 <b>Финансовая статистика</b>",
+        f"Период: <code>{_safe_text(period_title)}</code>",
+    ]
 
     totals_per_name = defaultdict(int)
     for s in services:
         totals_per_name[s.service_name] += 1
     seen_per_name = defaultdict(int)
 
-    has_any = False
+    has_any_rows = False
     for service in services:
         seen_per_name[service.service_name] += 1
         title = _service_title(
@@ -166,21 +195,55 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
             index=seen_per_name[service.service_name],
             total=totals_per_name[service.service_name],
         )
+        title_safe = _safe_text(title)
         rows = rows_by_service.get(service.id, [])
         if not rows:
-            report += f"• <b>{title}</b>: нет данных за период\n"
+            blocks.append(
+                "\n".join(
+                    [
+                        f"⏳ <b>{title_safe}</b>",
+                        "Нет замеров за выбранный период (нажмите «Статус», чтобы появилась история).",
+                    ]
+                )
+            )
             continue
 
-        has_any = True
+        has_any_rows = True
+        last = rows[-1]
+
         if not _is_monetary_service(service.service_name):
-            last = rows[-1]
-            report += f"• <b>{title}</b>\n"
-            report += "  Метрика: активные каналы\n"
-            report += f"  Текущее значение: {int(last.balance)}\n"
-            if len(rows) >= 2:
-                diff = int(round(last.balance - rows[0].balance))
-                report += f"  Изменение за период: {diff:+d}\n"
-            report += "\n"
+            if service.service_name == "wazzup":
+                lines = [
+                    f"✅ <b>{title_safe}</b>",
+                    "Метрика: <code>активные каналы</code>",
+                    f"Сейчас: <b>{int(last.balance)}</b>",
+                ]
+                if len(rows) >= 2:
+                    diff = int(round(last.balance - rows[0].balance))
+                    lines.append(f"Изменение за период: <code>{diff:+d}</code>")
+                else:
+                    lines.append("Изменение за период: <code>нужен ещё один замер</code>")
+                blocks.append("\n".join(lines))
+            elif service.service_name == "yandex_geocoder":
+                cur_raw = (last.currency or "").strip().upper()
+                lines = [f"✅ <b>{title_safe}</b>", "Метрика: <code>геокодер (не деньги)</code>"]
+                if cur_raw == "REQ":
+                    lines.append(f"Оценка остатка лимита: <code>{_fmt_money(float(last.balance))}</code>")
+                else:
+                    lines.append("Проверка API: <code>доступен</code>")
+                if len(rows) >= 2:
+                    diff = float(last.balance) - float(rows[0].balance)
+                    lines.append(f"Изменение за период: <code>{diff:+.2f}</code>")
+                blocks.append("\n".join(lines))
+            else:
+                blocks.append(
+                    "\n".join(
+                        [
+                            f"✅ <b>{title_safe}</b>",
+                            f"Значение: <code>{_fmt_money(float(last.balance))}</code>",
+                        ]
+                    )
+                )
             continue
 
         spend_by_currency = defaultdict(float)
@@ -193,45 +256,59 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
             elif delta > 0:
                 topup_by_currency[currency] += delta
 
-        last = rows[-1]
         current_currency = _normalize_currency(last.currency)
-        report += f"• <b>{title}</b>\n"
-        report += f"  Текущий баланс: {last.balance:.2f} {current_currency}\n"
+        lines = [
+            f"✅ <b>{title_safe}</b>",
+            f"Текущий баланс: <code>{_fmt_money(float(last.balance))} {_safe_text(current_currency)}</code>",
+        ]
         if len(rows) < 2:
-            report += "  Движение средств: недостаточно данных (нужны минимум 2 замера)\n\n"
+            lines.append("Движение за период: <code>нужно минимум 2 замера</code> (нажмите «Статус» ещё раз позже).")
+            blocks.append("\n".join(lines))
             continue
 
-        service_parts = []
         currencies = sorted(set(list(spend_by_currency.keys()) + list(topup_by_currency.keys())))
         if not currencies:
             currencies = [current_currency]
+        lines.append("<b>За период</b>:")
         for cur in currencies:
             spend = spend_by_currency[cur]
             topup = topup_by_currency[cur]
             totals_by_currency[cur]["spend"] += spend
             totals_by_currency[cur]["topup"] += topup
-            service_parts.append(f"{cur}: расход {spend:.2f}, пополнения {topup:.2f}")
-        report += "  " + " | ".join(service_parts) + "\n\n"
+            lines.append(
+                f"• {_safe_text(cur)} — расход <code>{_fmt_money(spend)}</code>, "
+                f"пополнения <code>{_fmt_money(topup)}</code>"
+            )
+        blocks.append("\n".join(lines))
 
-    if not has_any:
-        report += "Нет успешных замеров за выбранный период.\n"
-    else:
-        report += "<b>Итого по валютам</b>\n"
+    if not has_any_rows:
+        blocks.append("\n".join(["", "⚠️ Нет ни одного замера за период — сначала соберите историю через «Статус»."]))
+    elif totals_by_currency:
+        total_lines = ["", "📊 <b>Итого по валютам</b>"]
         shown_totals = 0
         for cur in sorted(totals_by_currency.keys()):
-            spend = totals_by_currency[cur]["spend"]
-            topup = totals_by_currency[cur]["topup"]
             if cur == "UNK":
                 continue
-            report += f"• {cur}: расход {spend:.2f}, пополнения {topup:.2f}\n"
+            spend = totals_by_currency[cur]["spend"]
+            topup = totals_by_currency[cur]["topup"]
+            total_lines.append(f"✅ <b>{_safe_text(cur)}</b>")
+            total_lines.append(f"Расход: <code>{_fmt_money(spend)}</code>")
+            total_lines.append(f"Пополнения: <code>{_fmt_money(topup)}</code>")
             shown_totals += 1
         if shown_totals == 0:
-            report += "• Нет денежных движений за выбранный период\n"
+            total_lines.append("Нет агрегированных сумм по валютам (проверьте валюты в замерах).")
+        blocks.append("\n".join(total_lines))
 
-    report += (
-        "\nПодсказка: /stats, /stats month, /stats all, "
-        "/stats avito, /stats avito all, /stats_export all"
+    blocks.append(
+        "\n".join(
+            [
+                "",
+                "<i>Команды:</i> <code>/stats</code>, <code>/stats month</code>, <code>/stats all</code>, "
+                "<code>/stats_export</code>",
+            ]
+        )
     )
+    report = "\n\n".join(blocks)
 
     # Аудит: сохраняем сгенерированный отчёт в БД.
     async with async_session_maker() as session:
