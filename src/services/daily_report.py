@@ -156,7 +156,7 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
         await session.commit()
 
 
-async def build_daily_group_report() -> str:
+async def build_daily_group_report() -> list[str]:
     now_utc = datetime.utcnow()
     since = now_utc - timedelta(days=1)
 
@@ -181,7 +181,7 @@ async def build_daily_group_report() -> str:
                 services.append((user, service, credentials))
 
         if not services:
-            return "📊 <b>Ежедневная сводка</b>\n\nНет активных сервисов."
+            return ["📊 <b>Ежедневная сводка</b>\n\nНет активных сервисов."]
 
     # 1) First refresh current balances from providers/manual sources.
     await _refresh_current_balances(services)
@@ -263,33 +263,34 @@ async def build_daily_group_report() -> str:
                 f"  Активные каналы: <b>{int(last.balance)}</b> (изменение <code>{diff:+.0f}</code>)"
             )
 
-    report = (
+    messages: list[str] = [
         "📊 <b>Ежедневная сводка</b>\n"
         "Период: последние 24ч (MSK)\n"
-        f"Сформировано: {format_app_dt(now_utc)}\n\n"
-    )
+        f"Сформировано: <code>{_safe_text(format_app_dt(now_utc))}</code>"
+    ]
 
-    for user in users:
+    for user in sorted(users, key=lambda u: u.id):
         blocks = user_blocks.get(user.id)
         if not blocks:
             continue
         uname = f"@{user.username}" if user.username else f"tg_id={user.tg_id}"
-        report += f"<b>👤 {uname}</b>\n" + "\n\n".join(blocks) + "\n\n"
+        messages.append(f"👤 <b>{_safe_text(uname)}</b>")
+        for block in blocks:
+            messages.append(block)
 
-    report += "<b>Итого по валютам</b>\n"
+    totals_lines = ["📊 <b>Итого по валютам</b>"]
     if not totals_by_currency:
-        report += "• Нет денежных движений за период\n"
+        totals_lines.append("• Нет денежных движений за период")
     else:
         for cur in sorted(totals_by_currency.keys()):
-            report += (
-                f"• {cur}: расход {totals_by_currency[cur]['spend']:.2f}, "
-                f"пополнения {totals_by_currency[cur]['topup']:.2f}\n"
+            totals_lines.append(
+                f"• {_safe_text(cur)}: расход <code>{totals_by_currency[cur]['spend']:.2f}</code>, "
+                f"пополнения <code>{totals_by_currency[cur]['topup']:.2f}</code>"
             )
+    messages.append("\n".join(totals_lines))
 
     if low_balance_alerts:
-        report += "\n<b>Пороговые алерты</b>\n" + "\n".join(low_balance_alerts)
+        messages.append("<b>Пороговые алерты</b>\n" + "\n".join(low_balance_alerts))
 
-    if len(report) > 3900:
-        report = report[:3850] + "\n\n…(сокращено)"
-    return report
+    return messages
 

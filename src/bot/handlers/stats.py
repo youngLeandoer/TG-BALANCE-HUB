@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 import csv
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from src.core.logger import setup_logger
+from src.core.report_formatting import SERVICE_MESSAGE_DELAY_SEC
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.database.models import BalanceHistory, Service, StatsReportHistory, User
 from src.database.session import async_session_maker
@@ -177,11 +179,9 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
         rows_by_service[row.service_id].append(row)
 
     totals_by_currency = defaultdict(lambda: {"spend": 0.0, "topup": 0.0})
-    blocks: list[str] = [
-        "📉 <b>Финансовая статистика</b>",
-        f"Период: <code>{_safe_text(period_title)}</code>",
+    messages: list[str] = [
+        "📉 <b>Финансовая статистика</b>\n\n" f"Период: <code>{_safe_text(period_title)}</code>",
     ]
-
     totals_per_name = defaultdict(int)
     for s in services:
         totals_per_name[s.service_name] += 1
@@ -198,7 +198,7 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
         title_safe = _safe_text(title)
         rows = rows_by_service.get(service.id, [])
         if not rows:
-            blocks.append(
+            messages.append(
                 "\n".join(
                     [
                         f"⏳ <b>{title_safe}</b>",
@@ -223,7 +223,7 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
                     lines.append(f"Изменение за период: <code>{diff:+d}</code>")
                 else:
                     lines.append("Изменение за период: <code>нужен ещё один замер</code>")
-                blocks.append("\n".join(lines))
+                messages.append("\n".join(lines))
             elif service.service_name == "yandex_geocoder":
                 cur_raw = (last.currency or "").strip().upper()
                 lines = [f"✅ <b>{title_safe}</b>", "Метрика: <code>геокодер (не деньги)</code>"]
@@ -234,9 +234,9 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
                 if len(rows) >= 2:
                     diff = float(last.balance) - float(rows[0].balance)
                     lines.append(f"Изменение за период: <code>{diff:+.2f}</code>")
-                blocks.append("\n".join(lines))
+                messages.append("\n".join(lines))
             else:
-                blocks.append(
+                messages.append(
                     "\n".join(
                         [
                             f"✅ <b>{title_safe}</b>",
@@ -263,7 +263,7 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
         ]
         if len(rows) < 2:
             lines.append("Движение за период: <code>нужно минимум 2 замера</code> (нажмите «Статус» ещё раз позже).")
-            blocks.append("\n".join(lines))
+            messages.append("\n".join(lines))
             continue
 
         currencies = sorted(set(list(spend_by_currency.keys()) + list(topup_by_currency.keys())))
@@ -279,12 +279,14 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
                 f"• {_safe_text(cur)} — расход <code>{_fmt_money(spend)}</code>, "
                 f"пополнения <code>{_fmt_money(topup)}</code>"
             )
-        blocks.append("\n".join(lines))
+        messages.append("\n".join(lines))
 
     if not has_any_rows:
-        blocks.append("\n".join(["", "⚠️ Нет ни одного замера за период — сначала соберите историю через «Статус»."]))
+        messages.append(
+            "⚠️ Нет ни одного замера за период — сначала соберите историю через «Статус»."
+        )
     elif totals_by_currency:
-        total_lines = ["", "📊 <b>Итого по валютам</b>"]
+        total_lines = ["📊 <b>Итого по валютам</b>"]
         shown_totals = 0
         for cur in sorted(totals_by_currency.keys()):
             if cur == "UNK":
@@ -297,18 +299,13 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
             shown_totals += 1
         if shown_totals == 0:
             total_lines.append("Нет агрегированных сумм по валютам (проверьте валюты в замерах).")
-        blocks.append("\n".join(total_lines))
+        messages.append("\n".join(total_lines))
 
-    blocks.append(
-        "\n".join(
-            [
-                "",
-                "<i>Команды:</i> <code>/stats</code>, <code>/stats month</code>, <code>/stats all</code>, "
-                "<code>/stats_export</code>",
-            ]
-        )
+    messages.append(
+        "<i>Команды:</i> <code>/stats</code>, <code>/stats month</code>, <code>/stats all</code>, "
+        "<code>/stats_export</code>"
     )
-    report = "\n\n".join(blocks)
+    report = "\n\n---\n\n".join(messages)
 
     # Аудит: сохраняем сгенерированный отчёт в БД.
     async with async_session_maker() as session:
@@ -326,7 +323,14 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
                 )
             )
             await session.commit()
-    await message.answer(report, reply_markup=get_main_menu_keyboard())
+    n = len(messages)
+    for i, chunk in enumerate(messages):
+        if i > 0:
+            await asyncio.sleep(SERVICE_MESSAGE_DELAY_SEC)
+        await message.answer(
+            chunk,
+            reply_markup=get_main_menu_keyboard() if i == n - 1 else None,
+        )
 
 
 async def _send_stats_export_csv(message: types.Message, raw_args: list[str]) -> None:

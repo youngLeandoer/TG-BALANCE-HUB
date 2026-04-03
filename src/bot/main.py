@@ -8,6 +8,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import from_url
 from src.core.config import settings
+from src.core.report_formatting import SERVICE_MESSAGE_DELAY_SEC
 from src.core.logger import setup_logger
 from src.database.init_db import init_db
 
@@ -92,8 +93,11 @@ async def _daily_report_loop(bot: Bot):
             )
         await asyncio.sleep(delay)
         try:
-            report = await build_daily_group_report()
-            await bot.send_message(settings.DAILY_STATS_CHAT_ID, report)
+            parts = await build_daily_group_report()
+            for i, part in enumerate(parts):
+                await bot.send_message(settings.DAILY_STATS_CHAT_ID, part)
+                if i + 1 < len(parts):
+                    await asyncio.sleep(SERVICE_MESSAGE_DELAY_SEC)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

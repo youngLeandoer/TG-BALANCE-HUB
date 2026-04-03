@@ -13,6 +13,7 @@ from src.database.session import async_session_maker
 from src.core.config import settings
 from src.core.logger import setup_logger
 from src.core.timezone import format_app_dt, parse_iso_as_utc, to_app_tz
+from src.core.report_formatting import SERVICE_MESSAGE_DELAY_SEC
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.services.providers.umnico import UmnicoConnector
 from src.services.providers.hosterby import HosterByConnector
@@ -373,5 +374,21 @@ async def cmd_status(message: types.Message):
             service.last_check = datetime.utcnow()
         
         await session.commit()
-        report = "📊 <b>Статус сервисов</b>\n\n" + "\n\n".join(blocks)
-        await message.answer(report, reply_markup=get_main_menu_keyboard())
+
+        if not blocks:
+            await message.answer(
+                "📊 <b>Статус сервисов</b>\n\n"
+                "Нет активных сервисов для проверки.",
+                reply_markup=get_main_menu_keyboard(),
+            )
+            return
+
+        await message.answer("📊 <b>Статус сервисов</b>")
+        n = len(blocks)
+        for i, block in enumerate(blocks):
+            if i > 0:
+                await asyncio.sleep(SERVICE_MESSAGE_DELAY_SEC)
+            await message.answer(
+                block,
+                reply_markup=get_main_menu_keyboard() if i == n - 1 else None,
+            )
