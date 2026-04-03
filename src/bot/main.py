@@ -17,6 +17,7 @@ from src.bot.handlers.daily_report import router as daily_report_router
 from src.bot.handlers.healthcheck import router as healthcheck_router
 from src.bot.handlers.status import router as status_router
 from src.bot.handlers.stats import router as stats_router
+from src.bot.handlers.remove_service import router as remove_service_router
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.services.daily_report import build_daily_group_report
 
@@ -26,6 +27,7 @@ daily_report_task: asyncio.Task | None = None
 MAIN_MENU_BUTTONS = (
     "➕ Добавить сервис",
     "📊 Статус сервисов",
+    "🗑 Удалить сервис",
     "📉 Статистика (3 дня)",
     "📅 Статистика (месяц)",
     "🗂 Статистика (всё время)",
@@ -123,6 +125,7 @@ async def main():
     dp.include_router(healthcheck_router)
     dp.include_router(status_router)
     dp.include_router(stats_router)
+    dp.include_router(remove_service_router)
     
     @dp.message(Command("start"))
     async def start_cmd(message: types.Message):
@@ -130,6 +133,7 @@ async def main():
             "🚀 <b>Balance Hub</b> запущен!\n\n"
             "Доступные команды:\n"
             "/add — добавить сервис\n"
+            "/remove — удалить сервис\n"
             "/status — проверить балансы\n"
             "/stats — статистика (по умолчанию 3 дня)\n"
             "/stats_export — экспорт статистики в CSV\n"
@@ -149,6 +153,7 @@ async def main():
             "Этот бот помогает отслеживать баланс и сроки оплаты сервисов.\n\n"
             "<b>Команды:</b>\n"
             "/add — добавить новый сервис\n"
+            "/remove — удалить сервис из списка\n"
             "/status — проверить баланс всех сервисов\n"
             "/stats — статистика за период (3 дня / месяц / всё время)\n"
             "/stats_export — CSV-экспорт статистики\n"
