@@ -1,4 +1,4 @@
-"""Удаление подключённого сервиса пользователя."""
+"""Удаление подключённого сервиса (общий список для всех)."""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ from collections import defaultdict
 from aiogram import F, Router, types
 from aiogram.filters import Command
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-
-from src.bot.handlers.stats import _service_title
+from src.core.stats_parsing import _service_title
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.core.logger import setup_logger
+from src.core.workspace import get_or_create_workspace_user_with_services, get_workspace_user
 from src.database.models import Service, User
 from src.database.session import async_session_maker
 
@@ -36,13 +35,10 @@ def _button_caption(service: Service, *, index: int, total: int) -> str:
     return text
 
 
-async def _load_user_services(tg_id: int) -> tuple[User | None, list[Service]]:
+async def _load_workspace_services() -> tuple[User | None, list[Service]]:
     async with async_session_maker() as session:
-        result = await session.execute(
-            select(User).where(User.tg_id == tg_id).options(selectinload(User.services))
-        )
-        user = result.scalar_one_or_none()
-        if not user or not user.services:
+        user = await get_or_create_workspace_user_with_services(session)
+        if not user.services:
             return user, []
         services = [
             s
@@ -56,8 +52,7 @@ async def _load_user_services(tg_id: int) -> tuple[User | None, list[Service]]:
 @router.message(Command("remove", "delete_service"))
 @router.message(F.text == "🗑 Удалить сервис")
 async def cmd_remove_start(message: types.Message):
-    tg_id = message.from_user.id
-    _user, services = await _load_user_services(tg_id)
+    _user, services = await _load_workspace_services()
     if not services:
         await message.answer(
             "🗑 <b>Удаление сервиса</b>\n\n"
@@ -104,8 +99,7 @@ async def cb_remove_pick(callback: types.CallbackQuery):
         await callback.answer("Некорректные данные", show_alert=True)
         return
 
-    tg_id = callback.from_user.id
-    _user, services = await _load_user_services(tg_id)
+    _user, services = await _load_workspace_services()
     svc = next((s for s in services if s.id == service_id), None)
     if not svc:
         await callback.answer("Сервис не найден", show_alert=True)
@@ -159,13 +153,15 @@ async def cb_remove_confirm(callback: types.CallbackQuery):
         await callback.answer("Ошибка данных", show_alert=True)
         return
 
-    tg_id = callback.from_user.id
+    actor_tg_id = callback.from_user.id
 
     async with async_session_maker() as session:
+        user = await get_workspace_user(session)
+        if not user:
+            await callback.answer("Сервис уже удалён или недоступен", show_alert=True)
+            return
         result = await session.execute(
-            select(Service)
-            .join(User)
-            .where(User.tg_id == tg_id, Service.id == service_id)
+            select(Service).where(Service.user_id == user.id, Service.id == service_id)
         )
         svc = result.scalar_one_or_none()
         if not svc:
@@ -193,8 +189,8 @@ async def cb_remove_confirm(callback: types.CallbackQuery):
         await session.delete(svc)
         await session.commit()
         logger.info(
-            "Service deleted user_tg_id=%s service_id=%s name=%s",
-            tg_id,
+            "Service deleted actor_tg_id=%s service_id=%s name=%s",
+            actor_tg_id,
             service_id,
             svc.service_name,
         )

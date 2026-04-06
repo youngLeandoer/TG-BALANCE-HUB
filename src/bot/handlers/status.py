@@ -6,10 +6,10 @@ from datetime import datetime
 import json
 import html
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-from src.database.models import User, Service, BalanceHistory
+from src.database.models import Service, BalanceHistory
 from src.services.base import connector_wait_timeout_seconds
 from src.database.session import async_session_maker
+from src.core.workspace import get_or_create_workspace_user_with_services
 from src.core.config import settings
 from src.core.logger import setup_logger
 from src.core.timezone import format_app_dt, parse_iso_as_utc, to_app_tz
@@ -105,14 +105,9 @@ async def cmd_status(message: types.Message):
         logger.warning("Local scrapers failed for /status (tg_id=%s): %s", tg_id, exc)
 
     async with async_session_maker() as session:
-        result = await session.execute(
-            select(User)
-            .where(User.tg_id == tg_id)
-            .options(selectinload(User.services))
-        )
-        user = result.scalar_one_or_none()
-        
-        if not user or not user.services:
+        user = await get_or_create_workspace_user_with_services(session)
+
+        if not user.services:
             await message.answer(
                 "📊 <b>Статус сервисов</b>\n\n"
                 "У вас пока нет добавленных сервисов.\n"

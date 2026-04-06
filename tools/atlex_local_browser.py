@@ -292,8 +292,8 @@ def _push_error_message(status_code: int, url: str, body_text: str) -> str:
         return f"HTTP 401: неверный INTERNAL_UPDATE_TOKEN. Ответ: {body_text[:300]}"
     if status_code == 404 and detail == "User not found":
         return (
-            "HTTP 404 «User not found»: в БД нет пользователя с таким tg_id. "
-            "ATLEX_LOCAL_TG_ID должен совпадать с вашим Telegram ID."
+            "HTTP 404 «Workspace user not found»: в БД нет строки workspace. "
+            "ATLEX_LOCAL_TG_ID должен совпадать с SHARED_WORKSPACE_TG_ID (или первым BOT_ADMINS)."
         )
     if status_code == 404 and "with this label not found" in detail:
         return (

@@ -7,14 +7,13 @@ import json
 import html
 
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-
 from src.core.config import settings
 from src.core.logger import setup_logger
 from src.core.timezone import format_app_dt
 from src.database.models import BalanceHistory, Service, User
 from src.services.base import connector_wait_timeout_seconds
 from src.database.session import async_session_maker
+from src.core.workspace import get_or_create_workspace_user_with_services
 from src.services.providers.avito import AvitoConnector
 from src.services.providers.hosterby import HosterByConnector
 from src.services.providers.regru import RegRuConnector
@@ -161,24 +160,21 @@ async def build_daily_group_report() -> list[str]:
     since = now_utc - timedelta(days=1)
 
     async with async_session_maker() as session:
-        users = (
-            await session.execute(select(User).options(selectinload(User.services)))
-        ).scalars().all()
+        user = await get_or_create_workspace_user_with_services(session)
 
         services = []
-        for user in users:
-            for service in user.services:
-                if not service.is_active or service.service_name == "mango_scraper":
-                    continue
-                credentials = service.credentials or {}
-                if isinstance(credentials, str):
-                    try:
-                        credentials = json.loads(credentials)
-                    except Exception:
-                        credentials = {}
-                if not isinstance(credentials, dict):
+        for service in user.services:
+            if not service.is_active or service.service_name == "mango_scraper":
+                continue
+            credentials = service.credentials or {}
+            if isinstance(credentials, str):
+                try:
+                    credentials = json.loads(credentials)
+                except Exception:
                     credentials = {}
-                services.append((user, service, credentials))
+            if not isinstance(credentials, dict):
+                credentials = {}
+            services.append((user, service, credentials))
 
         if not services:
             return ["📊 <b>Ежедневная сводка</b>\n\nНет активных сервисов."]
@@ -269,14 +265,12 @@ async def build_daily_group_report() -> list[str]:
         f"Сформировано: <code>{_safe_text(format_app_dt(now_utc))}</code>"
     ]
 
-    for user in sorted(users, key=lambda u: u.id):
-        blocks = user_blocks.get(user.id)
-        if not blocks:
-            continue
-        uname = f"@{user.username}" if user.username else f"tg_id={user.tg_id}"
-        messages.append(f"👤 <b>{_safe_text(uname)}</b>")
-        for block in blocks:
-            messages.append(block)
+    if services:
+        workspace_user = services[0][0]
+        blocks = user_blocks.get(workspace_user.id)
+        if blocks:
+            for block in blocks:
+                messages.append(block)
 
     totals_lines = ["📊 <b>Итого по валютам</b>"]
     if not totals_by_currency:

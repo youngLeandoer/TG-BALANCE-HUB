@@ -12,27 +12,22 @@ from aiogram import F, Router, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-
 from src.core.logger import setup_logger
 from src.core.report_formatting import SERVICE_MESSAGE_DELAY_SEC
+from src.core.stats_parsing import (
+    _is_monetary_service,
+    _normalize_currency,
+    _parse_since,
+    _parse_stats_args,
+    _service_title,
+)
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
-from src.database.models import BalanceHistory, Service, StatsReportHistory, User
+from src.core.workspace import get_or_create_workspace_user, get_or_create_workspace_user_with_services
+from src.database.models import BalanceHistory, Service, StatsReportHistory
 from src.database.session import async_session_maker
 
 logger = setup_logger(__name__)
 router = Router()
-
-NON_MONETARY_SERVICES = {"wazzup", "yandex_geocoder"}
-CURRENCY_ALIASES = {
-    "RUB": "RUB",
-    "RUR": "RUB",
-    "RUBLES": "RUB",
-    "RUBLE": "RUB",
-    "РУБ": "RUB",
-    "USD": "USD",
-    "USDT": "USD",
-}
 
 
 def _safe_text(value: object) -> str:
@@ -46,69 +41,6 @@ def _fmt_money(amount: float) -> str:
         return _safe_text(amount)
 
 
-def _display_base(service_name: str) -> str:
-    special = {
-        "yandex_geocoder": "Yandex Geocoder",
-        "yandex_cloud": "Yandex Cloud",
-        "timewebcloud": "Timeweb Cloud",
-        "hosterby": "Hoster.by",
-    }
-    if service_name in special:
-        return special[service_name]
-    if "_" in service_name:
-        return " ".join(p.capitalize() for p in service_name.split("_"))
-    return service_name.title()
-
-
-def _service_title(service: Service, *, index: int, total: int) -> str:
-    if service.service_name == "adminvps_scraper":
-        base = "AdminVPS"
-    elif service.service_name == "atlex_scraper":
-        base = "ATLEX"
-    elif service.service_name == "nic_scraper":
-        base = "NIC.RU"
-    else:
-        base = _display_base(service.service_name)
-    credentials = service.credentials or {}
-    if isinstance(credentials, str):
-        try:
-            credentials = json.loads(credentials)
-        except Exception:
-            credentials = {}
-    label = credentials.get("label") if isinstance(credentials, dict) else None
-    if label:
-        return f"{base} ({label})"
-    if total > 1:
-        return f"{base} (аккаунт {index}/{total})"
-    return base
-
-
-def _normalize_currency(raw: str | None) -> str:
-    value = (raw or "").strip().upper()
-    if not value:
-        return "UNK"
-    return CURRENCY_ALIASES.get(value, value)
-
-
-def _is_monetary_service(service_name: str) -> bool:
-    return service_name not in NON_MONETARY_SERVICES
-
-
-def _parse_since(raw_arg: str | None) -> tuple[datetime | None, str, str]:
-    if not raw_arg:
-        return datetime.utcnow() - timedelta(days=3), "3 дня", "3d"
-    arg = raw_arg.strip().lower()
-    if arg in {"all", "alltime", "все", "всё"}:
-        return None, "всё время", "all"
-    if arg == "month":
-        now = datetime.utcnow()
-        return datetime(year=now.year, month=now.month, day=1), "текущий месяц", "month"
-    if arg.isdigit() and int(arg) > 0:
-        days = int(arg)
-        return datetime.utcnow() - timedelta(days=days), f"{days} дней", f"{days}d"
-    return datetime.utcnow() - timedelta(days=3), "3 дня", "3d"
-
-
 def _period_filename_tag(period_code: str) -> str:
     return {
         "3d": "3days",
@@ -117,32 +49,13 @@ def _period_filename_tag(period_code: str) -> str:
     }.get(period_code, period_code)
 
 
-def _parse_stats_args(raw_args: list[str]) -> tuple[str | None, str | None]:
-    service_filter = None
-    period_arg = None
-    if len(raw_args) == 1:
-        single = raw_args[0].strip().lower()
-        if single in {"month", "all", "alltime", "все", "всё"} or single.isdigit():
-            period_arg = raw_args[0]
-        else:
-            service_filter = raw_args[0].strip().lower()
-    elif len(raw_args) >= 2:
-        service_filter = raw_args[0].strip().lower()
-        period_arg = raw_args[1]
-    return service_filter, period_arg
-
-
 async def _render_stats(message: types.Message, raw_args: list[str]):
-    tg_id = message.from_user.id
     service_filter, period_arg = _parse_stats_args(raw_args)
 
     since, period_title, period_code = _parse_since(period_arg)
     async with async_session_maker() as session:
-        user_result = await session.execute(
-            select(User).where(User.tg_id == tg_id).options(selectinload(User.services))
-        )
-        user = user_result.scalar_one_or_none()
-        if not user or not user.services:
+        user = await get_or_create_workspace_user_with_services(session)
+        if not user.services:
             await message.answer(
                 "📉 <b>Статистика</b>\n\nНет добавленных сервисов.",
                 reply_markup=get_main_menu_keyboard(),
@@ -309,20 +222,18 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
 
     # Аудит: сохраняем сгенерированный отчёт в БД.
     async with async_session_maker() as session:
-        user_result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = user_result.scalar_one_or_none()
-        if user:
-            session.add(
-                StatsReportHistory(
-                    user_id=user.id,
-                    period_code=period_code,
-                    service_filter=service_filter,
-                    since_at=since,
-                    report_text=report,
-                    generated_at=datetime.utcnow(),
-                )
+        user = await get_or_create_workspace_user(session)
+        session.add(
+            StatsReportHistory(
+                user_id=user.id,
+                period_code=period_code,
+                service_filter=service_filter,
+                since_at=since,
+                report_text=report,
+                generated_at=datetime.utcnow(),
             )
-            await session.commit()
+        )
+        await session.commit()
     n = len(messages)
     for i, chunk in enumerate(messages):
         if i > 0:
@@ -334,16 +245,12 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
 
 
 async def _send_stats_export_csv(message: types.Message, raw_args: list[str]) -> None:
-    tg_id = message.from_user.id
     service_filter, period_arg = _parse_stats_args(raw_args)
     since, period_title, period_code = _parse_since(period_arg)
 
     async with async_session_maker() as session:
-        user_result = await session.execute(
-            select(User).where(User.tg_id == tg_id).options(selectinload(User.services))
-        )
-        user = user_result.scalar_one_or_none()
-        if not user or not user.services:
+        user = await get_or_create_workspace_user_with_services(session)
+        if not user.services:
             await message.answer(
                 "📤 <b>Экспорт</b>\n\nНет добавленных сервисов.",
                 reply_markup=get_main_menu_keyboard(),
@@ -518,20 +425,18 @@ async def _send_stats_export_csv(message: types.Message, raw_args: list[str]) ->
 
     # Храним факт генерации экспорта.
     async with async_session_maker() as session:
-        user_result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = user_result.scalar_one_or_none()
-        if user:
-            session.add(
-                StatsReportHistory(
-                    user_id=user.id,
-                    period_code=f"csv:{period_code}",
-                    service_filter=service_filter,
-                    since_at=since,
-                    report_text=f"CSV export: {filename} ({period_title})",
-                    generated_at=datetime.utcnow(),
-                )
+        user = await get_or_create_workspace_user(session)
+        session.add(
+            StatsReportHistory(
+                user_id=user.id,
+                period_code=f"csv:{period_code}",
+                service_filter=service_filter,
+                since_at=since,
+                report_text=f"CSV export: {filename} ({period_title})",
+                generated_at=datetime.utcnow(),
             )
-            await session.commit()
+        )
+        await session.commit()
 
     await message.answer_document(
         file,

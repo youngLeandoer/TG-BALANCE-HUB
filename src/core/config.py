@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     # Bot
     BOT_TOKEN: str
     BOT_ADMINS: str
+    # Один общий набор сервисов для всех: tg_id строки users. 0 = взять первый ID из BOT_ADMINS.
+    SHARED_WORKSPACE_TG_ID: int = 0
     
     # Database
     DB_USER: str
@@ -45,6 +47,8 @@ class Settings(BaseSettings):
     MANGO_OTP_IMAP_PASSWORD: str = ""
     MANGO_OTP_EMAIL_FROM: str = "order@dokatka.ru"
     INTERNAL_UPDATE_TOKEN: str = ""
+    # Read-only JSON API (Bearer or X-API-Token); empty disables /api/v1/* routes.
+    API_TOKEN: str = ""
 
     # Optional: run local Playwright scrapers on the server
     # to push manual balances via internal endpoints before building reports.
@@ -73,6 +77,15 @@ class Settings(BaseSettings):
     @property
     def admin_ids(self) -> List[int]:
         return [int(x.strip()) for x in self.BOT_ADMINS.split(",") if x.strip()]
+
+    @property
+    def shared_workspace_tg_id(self) -> int:
+        if self.SHARED_WORKSPACE_TG_ID > 0:
+            return self.SHARED_WORKSPACE_TG_ID
+        admins = self.admin_ids
+        if admins:
+            return admins[0]
+        raise ValueError("Укажите SHARED_WORKSPACE_TG_ID или хотя бы одного админа в BOT_ADMINS")
     
 @lru_cache()
 def get_settings() -> Settings:
