@@ -5,6 +5,8 @@ import asyncio
 from datetime import datetime
 import json
 import html
+from dataclasses import dataclass
+from typing import Any
 from sqlalchemy import select
 from src.database.models import Service, BalanceHistory
 from src.services.base import connector_wait_timeout_seconds
@@ -43,6 +45,15 @@ SERVICE_CONNECTORS = {
     "yandex_cloud": YandexCloudConnector,
     "yandex_geocoder": YandexGeocoderConnector,
 }
+
+STATUS_MAX_CONCURRENCY = 6
+
+
+@dataclass(slots=True)
+class _StatusResult:
+    block: str
+    should_set_last_check: bool = False
+    snapshot: tuple[float, str] | None = None  # (balance, currency)
 
 
 def _record_balance_snapshot(
@@ -116,6 +127,9 @@ async def cmd_status(message: types.Message):
             )
             return
 
+        active_services: list[Service] = []
+        credentials_by_service_id: dict[int, dict[str, Any]] = {}
+
         # Помечаем дубли (одинаковый service_name) как аккаунт N/M,
         # чтобы в отчете было видно: это не баг, а несколько подключений.
         service_totals: dict[str, int] = {}
@@ -123,6 +137,7 @@ async def cmd_status(message: types.Message):
             if not svc.is_active or svc.service_name == "mango_scraper":
                 continue
             service_totals[svc.service_name] = service_totals.get(svc.service_name, 0) + 1
+
         service_seen: dict[str, int] = {}
 
         def build_service_title(service_name: str, label: str | None = None, base_title: str | None = None) -> str:
@@ -136,254 +151,279 @@ async def cmd_status(message: types.Message):
                 return f"{title} (аккаунт {current}/{total})"
             return title
 
-        blocks: list[str] = []
-        
+        title_by_service_id: dict[int, str] = {}
+
         for service in user.services:
-            if not service.is_active:
-                logger.info(f"Skip inactive service id={service.id} name={service.service_name}")
+            if not service.is_active or service.service_name == "mango_scraper":
                 continue
 
-            # Temporarily disabled due to regional access restrictions.
-            if service.service_name == "mango_scraper":
-                logger.info(f"Skip temporarily disabled service id={service.id} name={service.service_name}")
-                continue
-            
             try:
-                credentials = service.credentials
+                credentials: Any = service.credentials
                 if isinstance(credentials, str):
                     credentials = json.loads(credentials)
-
+                if not isinstance(credentials, dict):
+                    raise ValueError("credentials must be dict")
             except Exception as parse_error:
-                logger.error(f"Credentials parse failed: {parse_error}")
-                service_title = build_service_title(service.service_name)
-                blocks.append(
-                    "\n".join(
-                        [
-                            f"❌ <b>{service_title}</b>",
-                            f"Причина: <code>{_safe_text(parse_error)}</code>",
-                        ]
-                    )
-                )
+                title_by_service_id[service.id] = build_service_title(service.service_name)
+                credentials_by_service_id[service.id] = {"__parse_error__": parse_error}
+                active_services.append(service)
                 continue
-            
+
+            credentials_by_service_id[service.id] = credentials
+
             if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
                 base_title = (
                     "AdminVPS"
                     if service.service_name == "adminvps_scraper"
                     else ("ATLEX" if service.service_name == "atlex_scraper" else "NIC.RU")
                 )
-                service_title = build_service_title(
-                    service.service_name,
-                    credentials.get("label"),
-                    base_title=base_title,
+                title_by_service_id[service.id] = build_service_title(
+                    service.service_name, credentials.get("label"), base_title=base_title
                 )
-                if "manual_balance" in credentials:
-                    manual_balance = float(credentials.get("manual_balance", 0.0))
-                    manual_currency = str(credentials.get("manual_currency", "RUB"))
-                    threshold = _resolve_alert_threshold_rub(credentials)
-                    lines = [
-                        f"✅ <b>{service_title}</b>",
-                        f"Баланс: <code>{_fmt_amount(manual_balance)} {_safe_text(manual_currency)}</code>",
-                    ]
-                    if _normalize_currency(manual_currency) == "RUB" and manual_balance <= threshold:
-                        lines.append(f"⚠️ Ниже порога: <code>{threshold:.2f} RUB</code>")
-                    manual_updated_at = credentials.get("manual_updated_at")
-                    if isinstance(manual_updated_at, str) and manual_updated_at:
-                        parsed = parse_iso_as_utc(manual_updated_at)
-                        lines.append(
-                            f"Обновлено: <code>{_safe_text(format_app_dt(parsed) if parsed else manual_updated_at)}</code>"
+            else:
+                title_by_service_id[service.id] = build_service_title(service.service_name, credentials.get("label"))
+
+            active_services.append(service)
+
+        sem = asyncio.Semaphore(STATUS_MAX_CONCURRENCY)
+
+        async def _fetch_one(service: Service) -> _StatusResult:
+                title = title_by_service_id.get(service.id, service.service_name.title())
+                credentials = credentials_by_service_id.get(service.id, {}) or {}
+
+                parse_error = credentials.get("__parse_error__")
+                if parse_error:
+                    return _StatusResult(
+                        block="\n".join(
+                            [
+                                f"❌ <b>{title}</b>",
+                                f"Причина: <code>{_safe_text(parse_error)}</code>",
+                            ]
                         )
-                    blocks.append("\n".join(lines))
-                    _record_balance_snapshot(
-                        session,
-                        service_id=service.id,
-                        balance=manual_balance,
-                        currency=manual_currency,
-                        status="OK",
                     )
-                    service.last_check = datetime.utcnow()
-                else:
+
+                if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
+                    if "manual_balance" in credentials:
+                        manual_balance = float(credentials.get("manual_balance", 0.0))
+                        manual_currency = str(credentials.get("manual_currency", "RUB"))
+                        threshold = _resolve_alert_threshold_rub(credentials)
+                        lines = [
+                            f"✅ <b>{title}</b>",
+                            f"Баланс: <code>{_fmt_amount(manual_balance)} {_safe_text(manual_currency)}</code>",
+                        ]
+                        if _normalize_currency(manual_currency) == "RUB" and manual_balance <= threshold:
+                            lines.append(f"⚠️ Ниже порога: <code>{threshold:.2f} RUB</code>")
+                        manual_updated_at = credentials.get("manual_updated_at")
+                        if isinstance(manual_updated_at, str) and manual_updated_at:
+                            parsed = parse_iso_as_utc(manual_updated_at)
+                            lines.append(
+                                f"Обновлено: <code>{_safe_text(format_app_dt(parsed) if parsed else manual_updated_at)}</code>"
+                            )
+                        return _StatusResult(
+                            block="\n".join(lines),
+                            should_set_last_check=True,
+                            snapshot=(manual_balance, manual_currency),
+                        )
+
                     helper = (
                         "tools/adminvps_local_browser.py"
                         if service.service_name == "adminvps_scraper"
-                        else ("tools/atlex_local_browser.py" if service.service_name == "atlex_scraper" else "tools/nic_local_browser.py")
+                        else (
+                            "tools/atlex_local_browser.py"
+                            if service.service_name == "atlex_scraper"
+                            else "tools/nic_local_browser.py"
+                        )
                     )
                     env_prefix = (
                         "ADMINVPS_LOCAL_*"
                         if service.service_name == "adminvps_scraper"
                         else ("ATLEX_LOCAL_*" if service.service_name == "atlex_scraper" else "NIC_LOCAL_*")
                     )
-                    blocks.append(
-                        "\n".join(
+                    return _StatusResult(
+                        block="\n".join(
                             [
-                                f"⏳ <b>{service_title}</b>",
+                                f"⏳ <b>{title}</b>",
                                 "Ожидаю баланс с вашего ПК.",
                                 f"Запуск: <code>{helper}</code>",
                                 f"Переменные: <code>{env_prefix}</code> + <code>INTERNAL_UPDATE_TOKEN</code>",
                             ]
                         )
                     )
-                continue
 
-            connector_cls = SERVICE_CONNECTORS.get(service.service_name)
-            if not connector_cls:
-                logger.warning(f"No connector for service id={service.id} name={service.service_name}")
-                service_title = build_service_title(service.service_name, credentials.get("label"))
-                blocks.append(
-                    "\n".join(
-                        [
-                            f"❌ <b>{service_title}</b>",
-                            "Причина: <code>сервис пока не поддерживается</code>",
-                        ]
+                connector_cls = SERVICE_CONNECTORS.get(service.service_name)
+                if not connector_cls:
+                    return _StatusResult(
+                        block="\n".join(
+                            [
+                                f"❌ <b>{title}</b>",
+                                "Причина: <code>сервис пока не поддерживается</code>",
+                            ]
+                        )
                     )
-                )
-                continue
 
-            logger.info(
-                f"Checking service id={service.id} name={service.service_name} with connector={connector_cls.__name__}"
-            )
-            connector = connector_cls(credentials=credentials)
-            try:
-                # Один проблемный провайдер не должен подвешивать весь /status.
-                balance_data = await asyncio.wait_for(
-                    connector.get_balance_data(),
-                    timeout=connector_wait_timeout_seconds(service.service_name),
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"Service check timeout id={service.id} name={service.service_name}")
-                service_title = build_service_title(service.service_name, credentials.get("label"))
-                blocks.append(
-                    "\n".join(
+                async with sem:
+                    try:
+                        connector = connector_cls(credentials=credentials)
+                        balance_data = await asyncio.wait_for(
+                            connector.get_balance_data(),
+                            timeout=connector_wait_timeout_seconds(service.service_name),
+                        )
+                    except asyncio.TimeoutError:
+                        return _StatusResult(
+                            block="\n".join(
+                                [
+                                    f"❌ <b>{title}</b>",
+                                    "Причина: <code>таймаут запроса к API</code>",
+                                ]
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Service check failed service_id=%s name=%s err=%s",
+                            service.id,
+                            service.service_name,
+                            exc,
+                        )
+                        return _StatusResult(
+                            block="\n".join(
+                                [
+                                    f"❌ <b>{title}</b>",
+                                    "Причина: <code>ошибка запроса к API</code>",
+                                ]
+                            )
+                        )
+
+                if balance_data.status == "OK":
+                    threshold = _resolve_alert_threshold_rub(credentials)
+                    lines = [f"✅ <b>{title}</b>"]
+                    if service.service_name == "wazzup":
+                        lines.append("Статус: <code>API доступен</code>")
+                        lines.append(f"Активных каналов: <b>{int(balance_data.balance)}</b>")
+                        unpaid_channels = 0
+                        if (
+                            isinstance(balance_data.error_message, str)
+                            and balance_data.error_message.startswith("not_enough_money=")
+                        ):
+                            try:
+                                unpaid_channels = int(balance_data.error_message.split("=", 1)[1])
+                            except ValueError:
+                                unpaid_channels = 0
+                        lines.append(f"Каналов с неоплатой: <b>{unpaid_channels}</b>")
+                    elif service.service_name == "umnico":
+                        lines.append(
+                            f"Баланс: <code>{_fmt_amount(balance_data.balance)} {_safe_text(balance_data.currency)}</code>"
+                        )
+                        active = None
+                        total = None
+                        active_list: list[str] | None = None
+                        active_more: int = 0
+                        inactive_list: list[str] | None = None
+                        inactive_more: int = 0
+                        if isinstance(balance_data.error_message, str) and balance_data.error_message.strip():
+                            raw = balance_data.error_message.strip()
+                            if raw.startswith("{"):
+                                try:
+                                    payload = json.loads(raw)
+                                    if isinstance(payload, dict):
+                                        active = payload.get("channels_active")
+                                        total = payload.get("channels_total")
+                                        active_list = payload.get("active_channels")
+                                        active_more = int(payload.get("active_channels_more") or 0)
+                                        inactive_list = payload.get("inactive_channels")
+                                        inactive_more = int(payload.get("inactive_channels_more") or 0)
+                                        active = int(active) if active is not None else None
+                                        total = int(total) if total is not None else None
+                                except Exception:
+                                    active = None
+                                    total = None
+                            elif "channels_active=" in raw:
+                                try:
+                                    parts = dict(p.split("=", 1) for p in raw.split(";") if "=" in p)
+                                    active = (
+                                        int(parts.get("channels_active"))
+                                        if parts.get("channels_active") not in (None, "None")
+                                        else None
+                                    )
+                                    total = (
+                                        int(parts.get("channels_total"))
+                                        if parts.get("channels_total") not in (None, "None")
+                                        else None
+                                    )
+                                except Exception:
+                                    active = None
+                                    total = None
+                        if active is not None and total is not None:
+                            lines.append(f"Каналы: <b>{active}/{total}</b> активны")
+                        if active_list:
+                            lines.append("✅ <b>Активные</b>:")
+                            lines.extend([f"  • <code>{_safe_text(ch)}</code>" for ch in active_list])
+                            if active_more > 0:
+                                lines.append(f"  • …и ещё <b>{active_more}</b>")
+                        if inactive_list:
+                            lines.append("⛔ <b>Неактивные</b>:")
+                            lines.extend([f"  • <code>{_safe_text(ch)}</code>" for ch in inactive_list])
+                            if inactive_more > 0:
+                                lines.append(f"  • …и ещё <b>{inactive_more}</b>")
+                    else:
+                        lines.append(
+                            f"Баланс: <code>{_fmt_amount(balance_data.balance)} {_safe_text(balance_data.currency)}</code>"
+                        )
+                        if _normalize_currency(balance_data.currency) == "RUB" and float(balance_data.balance) <= threshold:
+                            lines.append(f"⚠️ Ниже порога: <code>{threshold:.2f} RUB</code>")
+
+                    if balance_data.expiration:
+                        expiration_dt = to_app_tz(balance_data.expiration)
+                        lines.append(f"Оплатить до: <code>{expiration_dt.strftime('%d.%m.%Y %H:%M %Z')}</code>")
+
+                    return _StatusResult(
+                        block="\n".join(lines),
+                        should_set_last_check=True,
+                        snapshot=(float(balance_data.balance), str(balance_data.currency)),
+                    )
+
+                return _StatusResult(
+                    block="\n".join(
                         [
-                            f"❌ <b>{service_title}</b>",
-                            "Причина: <code>таймаут запроса к API</code>",
+                            f"❌ <b>{title}</b>",
+                            f"Причина: <code>{_safe_text(balance_data.error_message)}</code>",
                         ]
-                    )
+                    ),
+                    should_set_last_check=True,
                 )
-                continue
-            
-            if balance_data.status == "OK":
-                service_title = build_service_title(service.service_name, credentials.get("label"))
-                threshold = _resolve_alert_threshold_rub(credentials)
-                lines = [f"✅ <b>{service_title}</b>"]
-                if service.service_name == "wazzup":
-                    lines.append("Статус: <code>API доступен</code>")
-                    lines.append(f"Активных каналов: <b>{int(balance_data.balance)}</b>")
-                    unpaid_channels = 0
-                    if (
-                        isinstance(balance_data.error_message, str)
-                        and balance_data.error_message.startswith("not_enough_money=")
-                    ):
-                        try:
-                            unpaid_channels = int(balance_data.error_message.split("=", 1)[1])
-                        except ValueError:
-                            unpaid_channels = 0
-                    lines.append(f"Каналов с неоплатой: <b>{unpaid_channels}</b>")
-                elif service.service_name == "umnico":
-                    lines.append(
-                        f"Баланс: <code>{_fmt_amount(balance_data.balance)} {_safe_text(balance_data.currency)}</code>"
-                    )
-                    active = None
-                    total = None
-                    active_list: list[str] | None = None
-                    active_more: int = 0
-                    inactive_list: list[str] | None = None
-                    inactive_more: int = 0
-                    if isinstance(balance_data.error_message, str) and balance_data.error_message.strip():
-                        raw = balance_data.error_message.strip()
-                        # New format: JSON blob with active channel list.
-                        if raw.startswith("{"):
-                            try:
-                                payload = json.loads(raw)
-                                if isinstance(payload, dict):
-                                    active = payload.get("channels_active")
-                                    total = payload.get("channels_total")
-                                    active_list = payload.get("active_channels")
-                                    active_more = int(payload.get("active_channels_more") or 0)
-                                    inactive_list = payload.get("inactive_channels")
-                                    inactive_more = int(payload.get("inactive_channels_more") or 0)
-                                    active = int(active) if active is not None else None
-                                    total = int(total) if total is not None else None
-                            except Exception:
-                                active = None
-                                total = None
-                        # Legacy format: channels_active=..;channels_total=..
-                        elif "channels_active=" in raw:
-                            try:
-                                parts = dict(p.split("=", 1) for p in raw.split(";") if "=" in p)
-                                active = (
-                                    int(parts.get("channels_active"))
-                                    if parts.get("channels_active") not in (None, "None")
-                                    else None
-                                )
-                                total = (
-                                    int(parts.get("channels_total"))
-                                    if parts.get("channels_total") not in (None, "None")
-                                    else None
-                                )
-                            except Exception:
-                                active = None
-                                total = None
-                    if active is not None and total is not None:
-                        lines.append(f"Каналы: <b>{active}/{total}</b> активны")
-                    if active_list:
-                        lines.append("✅ <b>Активные</b>:")
-                        lines.extend([f"  • <code>{_safe_text(ch)}</code>" for ch in active_list])
-                        if active_more > 0:
-                            lines.append(f"  • …и ещё <b>{active_more}</b>")
-                    if inactive_list:
-                        lines.append("⛔ <b>Неактивные</b>:")
-                        lines.extend([f"  • <code>{_safe_text(ch)}</code>" for ch in inactive_list])
-                        if inactive_more > 0:
-                            lines.append(f"  • …и ещё <b>{inactive_more}</b>")
-                else:
-                    lines.append(
-                        f"Баланс: <code>{_fmt_amount(balance_data.balance)} {_safe_text(balance_data.currency)}</code>"
-                    )
-                    if (
-                        _normalize_currency(balance_data.currency) == "RUB"
-                        and float(balance_data.balance) <= threshold
-                    ):
-                        lines.append(f"⚠️ Ниже порога: <code>{threshold:.2f} RUB</code>")
-                if balance_data.expiration:
-                    expiration_dt = to_app_tz(balance_data.expiration)
-                    lines.append(f"Оплатить до: <code>{expiration_dt.strftime('%d.%m.%Y %H:%M %Z')}</code>")
-                blocks.append("\n".join(lines))
+
+        results: list[_StatusResult] = await asyncio.gather(*[_fetch_one(svc) for svc in active_services])
+
+        blocks: list[str] = []
+        for service, res in zip(active_services, results):
+            blocks.append(res.block)
+            if res.snapshot is not None:
+                bal, cur = res.snapshot
                 _record_balance_snapshot(
                     session,
                     service_id=service.id,
-                    balance=float(balance_data.balance),
-                    currency=str(balance_data.currency),
+                    balance=float(bal),
+                    currency=str(cur),
                     status="OK",
                 )
-            else:
-                service_title = build_service_title(service.service_name, credentials.get("label"))
-                blocks.append(
-                    "\n".join(
-                        [
-                            f"❌ <b>{service_title}</b>",
-                            f"Причина: <code>{_safe_text(balance_data.error_message)}</code>",
-                        ]
-                    )
-                )
-            service.last_check = datetime.utcnow()
-        
+            if res.should_set_last_check:
+                service.last_check = datetime.utcnow()
+
         await session.commit()
 
-        if not blocks:
-            await message.answer(
-                "📊 <b>Статус сервисов</b>\n\n"
-                "Нет активных сервисов для проверки.",
-                reply_markup=get_main_menu_keyboard(),
-            )
-            return
+    if not blocks:
+        await message.answer(
+            "📊 <b>Статус сервисов</b>\n\n"
+            "Нет активных сервисов для проверки.",
+            reply_markup=get_main_menu_keyboard(),
+        )
+        return
 
-        await message.answer("📊 <b>Статус сервисов</b>")
-        n = len(blocks)
-        for i, block in enumerate(blocks):
-            if i > 0:
-                await asyncio.sleep(SERVICE_MESSAGE_DELAY_SEC)
-            await message.answer(
-                block,
-                reply_markup=get_main_menu_keyboard() if i == n - 1 else None,
-            )
+    await message.answer("📊 <b>Статус сервисов</b>")
+    n = len(blocks)
+    for i, block in enumerate(blocks):
+        if i > 0:
+            await asyncio.sleep(SERVICE_MESSAGE_DELAY_SEC)
+        await message.answer(
+            block,
+            reply_markup=get_main_menu_keyboard() if i == n - 1 else None,
+        )

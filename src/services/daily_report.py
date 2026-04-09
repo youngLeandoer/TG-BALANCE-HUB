@@ -115,43 +115,55 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
     # are included in the final aggregated report.
     await run_local_scrapers_if_enabled(reason="daily_report_pre_refresh")
 
-    async with async_session_maker() as session:
-        for _, service, credentials in services:
-            if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
-                if "manual_balance" in credentials:
-                    try:
-                        bal = float(credentials.get("manual_balance", 0.0))
-                    except (TypeError, ValueError):
-                        continue
-                    cur = str(credentials.get("manual_currency", "RUB"))
-                    _record_snapshot(session, service.id, bal, cur, status="OK")
-                continue
+    sem = asyncio.Semaphore(6)
 
-            connector_cls = SERVICE_CONNECTORS.get(service.service_name)
-            if not connector_cls:
+    async def _fetch_one(service: Service, credentials: dict) -> tuple[int, float, str] | None:
+        if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
+            if "manual_balance" in credentials:
+                try:
+                    bal = float(credentials.get("manual_balance", 0.0))
+                except (TypeError, ValueError):
+                    return None
+                cur = str(credentials.get("manual_currency", "RUB"))
+                return (service.id, bal, cur)
+            return None
+
+        connector_cls = SERVICE_CONNECTORS.get(service.service_name)
+        if not connector_cls:
+            return None
+
+        async with sem:
+            connector = connector_cls(credentials=credentials)
+            balance_data = await asyncio.wait_for(
+                connector.get_balance_data(),
+                timeout=connector_wait_timeout_seconds(service.service_name),
+            )
+        if balance_data.status != "OK":
+            return None
+        return (service.id, float(balance_data.balance), str(balance_data.currency))
+
+    tasks: list[asyncio.Task[tuple[int, float, str] | None]] = []
+    for _, service, credentials in services:
+        tasks.append(asyncio.create_task(_fetch_one(service, credentials)))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    async with async_session_maker() as session:
+        for res, (_, service, _) in zip(results, services):
+            if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
                 continue
-            try:
-                connector = connector_cls(credentials=credentials)
-                balance_data = await asyncio.wait_for(
-                    connector.get_balance_data(),
-                    timeout=connector_wait_timeout_seconds(service.service_name),
-                )
-                if balance_data.status == "OK":
-                    _record_snapshot(
-                        session,
-                        service.id,
-                        float(balance_data.balance),
-                        str(balance_data.currency),
-                        status="OK",
-                    )
-            except Exception as exc:
+            if isinstance(res, Exception):
                 logger.warning(
                     "Daily pre-refresh failed service_id=%s name=%s err=%s",
                     service.id,
                     service.service_name,
-                    exc,
+                    res,
                 )
                 continue
+            if res is None:
+                continue
+            service_id, bal, cur = res
+            _record_snapshot(session, service_id, bal, cur, status="OK")
         await session.commit()
 
 

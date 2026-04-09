@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     LOW_BALANCE_THRESHOLD_RUB: float = 1000.0
     DAILY_STATS_ENABLED: bool = False
     DAILY_STATS_CHAT_ID: int = 0
+    # Optional: comma-separated local times in APP_TIMEZONE, e.g. "10:00,15:00,20:00".
+    # If set, overrides DAILY_STATS_HOUR_UTC/MINUTE_UTC.
+    DAILY_STATS_TIMES_LOCAL: str = ""
     DAILY_STATS_HOUR_UTC: int = 7
     DAILY_STATS_MINUTE_UTC: int = 0
     # If > 0, overrides daily schedule and sends report every N minutes (useful for testing).

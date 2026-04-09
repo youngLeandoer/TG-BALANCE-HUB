@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -20,6 +21,7 @@ from src.bot.handlers.status import router as status_router
 from src.bot.handlers.stats import router as stats_router
 from src.bot.handlers.remove_service import router as remove_service_router
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
+from src.bot.middlewares.request_guard import RequestGuardMiddleware
 from src.services.daily_report import build_daily_group_report
 
 logger = setup_logger(__name__)
@@ -53,12 +55,22 @@ async def on_startup(bot: Bot):
                 settings.DAILY_STATS_INTERVAL_MINUTES,
             )
         else:
-            logger.info(
-                "Daily report loop enabled chat_id=%s at %02d:%02d UTC",
-                settings.DAILY_STATS_CHAT_ID,
-                settings.DAILY_STATS_HOUR_UTC,
-                settings.DAILY_STATS_MINUTE_UTC,
-            )
+            times_local = _parse_times_local(getattr(settings, "DAILY_STATS_TIMES_LOCAL", ""))
+            if times_local:
+                pretty = ", ".join(f"{h:02d}:{m:02d}" for h, m in times_local)
+                logger.info(
+                    "Daily report loop enabled chat_id=%s at %s (%s)",
+                    settings.DAILY_STATS_CHAT_ID,
+                    pretty,
+                    settings.APP_TIMEZONE,
+                )
+            else:
+                logger.info(
+                    "Daily report loop enabled chat_id=%s at %02d:%02d UTC",
+                    settings.DAILY_STATS_CHAT_ID,
+                    settings.DAILY_STATS_HOUR_UTC,
+                    settings.DAILY_STATS_MINUTE_UTC,
+                )
 
 
 async def on_shutdown(bot: Bot):
@@ -82,15 +94,60 @@ def _seconds_until_next_run_utc(hour: int, minute: int) -> float:
     return max((target - now).total_seconds(), 1.0)
 
 
+def _parse_times_local(raw: str) -> list[tuple[int, int]]:
+    value = (raw or "").strip()
+    if not value:
+        return []
+    times: list[tuple[int, int]] = []
+    for part in value.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        hh, mm = p.split(":", 1)
+        h = int(hh)
+        m = int(mm)
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError(f"Invalid time: {p}")
+        times.append((h, m))
+    # de-dup + keep stable order
+    seen: set[tuple[int, int]] = set()
+    uniq: list[tuple[int, int]] = []
+    for t in times:
+        if t in seen:
+            continue
+        uniq.append(t)
+        seen.add(t)
+    return uniq
+
+
+def _seconds_until_next_run_local(times: list[tuple[int, int]], *, tz_name: str) -> float:
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz=tz)
+    candidates: list[datetime] = []
+    for hour, minute in times:
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        candidates.append(target)
+    if not candidates:
+        return 1.0
+    next_target = min(candidates)
+    return max((next_target - now).total_seconds(), 1.0)
+
+
 async def _daily_report_loop(bot: Bot):
     while True:
         if settings.DAILY_STATS_INTERVAL_MINUTES > 0:
             delay = max(float(settings.DAILY_STATS_INTERVAL_MINUTES) * 60.0, 10.0)
         else:
-            delay = _seconds_until_next_run_utc(
-                settings.DAILY_STATS_HOUR_UTC,
-                settings.DAILY_STATS_MINUTE_UTC,
-            )
+            times_local = _parse_times_local(getattr(settings, "DAILY_STATS_TIMES_LOCAL", ""))
+            if times_local:
+                delay = _seconds_until_next_run_local(times_local, tz_name=settings.APP_TIMEZONE)
+            else:
+                delay = _seconds_until_next_run_utc(
+                    settings.DAILY_STATS_HOUR_UTC,
+                    settings.DAILY_STATS_MINUTE_UTC,
+                )
         await asyncio.sleep(delay)
         try:
             parts = await build_daily_group_report()
@@ -116,6 +173,10 @@ async def main():
     storage = RedisStorage(redis=redis)
     
     dp = Dispatcher(storage=storage)  # ✅ Передаём storage
+
+    # Anti double-click: one request at a time per user
+    dp.message.middleware(RequestGuardMiddleware())
+    dp.callback_query.middleware(RequestGuardMiddleware())
     
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
