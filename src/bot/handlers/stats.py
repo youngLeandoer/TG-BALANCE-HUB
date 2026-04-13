@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 import csv
 from datetime import datetime, timedelta
+import html
 import io
 import json
 
@@ -10,75 +12,33 @@ from aiogram import F, Router, types
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-
 from src.core.logger import setup_logger
+from src.core.report_formatting import SERVICE_MESSAGE_DELAY_SEC
+from src.core.stats_parsing import (
+    _is_monetary_service,
+    _normalize_currency,
+    _parse_since,
+    _parse_stats_args,
+    _service_title,
+)
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
-from src.database.models import BalanceHistory, Service, StatsReportHistory, User
+from src.core.workspace import get_or_create_workspace_user, get_or_create_workspace_user_with_services
+from src.database.models import BalanceHistory, Service, StatsReportHistory
 from src.database.session import async_session_maker
 
 logger = setup_logger(__name__)
 router = Router()
 
-NON_MONETARY_SERVICES = {"wazzup"}
-CURRENCY_ALIASES = {
-    "RUB": "RUB",
-    "RUR": "RUB",
-    "RUBLES": "RUB",
-    "RUBLE": "RUB",
-    "РУБ": "RUB",
-    "USD": "USD",
-    "USDT": "USD",
-}
+
+def _safe_text(value: object) -> str:
+    return html.escape(str(value), quote=False)
 
 
-def _service_title(service: Service, *, index: int, total: int) -> str:
-    if service.service_name == "adminvps_scraper":
-        base = "AdminVPS"
-    elif service.service_name == "atlex_scraper":
-        base = "ATLEX"
-    elif service.service_name == "nic_scraper":
-        base = "NIC.RU"
-    else:
-        base = service.service_name.title()
-    credentials = service.credentials or {}
-    if isinstance(credentials, str):
-        try:
-            credentials = json.loads(credentials)
-        except Exception:
-            credentials = {}
-    label = credentials.get("label") if isinstance(credentials, dict) else None
-    if label:
-        return f"{base} ({label})"
-    if total > 1:
-        return f"{base} (аккаунт {index}/{total})"
-    return base
-
-
-def _normalize_currency(raw: str | None) -> str:
-    value = (raw or "").strip().upper()
-    if not value:
-        return "UNK"
-    return CURRENCY_ALIASES.get(value, value)
-
-
-def _is_monetary_service(service_name: str) -> bool:
-    return service_name not in NON_MONETARY_SERVICES
-
-
-def _parse_since(raw_arg: str | None) -> tuple[datetime | None, str, str]:
-    if not raw_arg:
-        return datetime.utcnow() - timedelta(days=3), "3 дня", "3d"
-    arg = raw_arg.strip().lower()
-    if arg in {"all", "alltime", "все", "всё"}:
-        return None, "всё время", "all"
-    if arg == "month":
-        now = datetime.utcnow()
-        return datetime(year=now.year, month=now.month, day=1), "текущий месяц", "month"
-    if arg.isdigit() and int(arg) > 0:
-        days = int(arg)
-        return datetime.utcnow() - timedelta(days=days), f"{days} дней", f"{days}d"
-    return datetime.utcnow() - timedelta(days=3), "3 дня", "3d"
+def _fmt_money(amount: float) -> str:
+    try:
+        return f"{float(amount):,.2f}".replace(",", " ")
+    except Exception:
+        return _safe_text(amount)
 
 
 def _period_filename_tag(period_code: str) -> str:
@@ -89,32 +49,13 @@ def _period_filename_tag(period_code: str) -> str:
     }.get(period_code, period_code)
 
 
-def _parse_stats_args(raw_args: list[str]) -> tuple[str | None, str | None]:
-    service_filter = None
-    period_arg = None
-    if len(raw_args) == 1:
-        single = raw_args[0].strip().lower()
-        if single in {"month", "all", "alltime", "все", "всё"} or single.isdigit():
-            period_arg = raw_args[0]
-        else:
-            service_filter = raw_args[0].strip().lower()
-    elif len(raw_args) >= 2:
-        service_filter = raw_args[0].strip().lower()
-        period_arg = raw_args[1]
-    return service_filter, period_arg
-
-
 async def _render_stats(message: types.Message, raw_args: list[str]):
-    tg_id = message.from_user.id
     service_filter, period_arg = _parse_stats_args(raw_args)
 
     since, period_title, period_code = _parse_since(period_arg)
     async with async_session_maker() as session:
-        user_result = await session.execute(
-            select(User).where(User.tg_id == tg_id).options(selectinload(User.services))
-        )
-        user = user_result.scalar_one_or_none()
-        if not user or not user.services:
+        user = await get_or_create_workspace_user_with_services(session)
+        if not user.services:
             await message.answer(
                 "📉 <b>Статистика</b>\n\nНет добавленных сервисов.",
                 reply_markup=get_main_menu_keyboard(),
@@ -151,14 +92,15 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
         rows_by_service[row.service_id].append(row)
 
     totals_by_currency = defaultdict(lambda: {"spend": 0.0, "topup": 0.0})
-    report = f"📉 <b>Финансовая статистика</b>\nПериод: <b>{period_title}</b>\n\n"
-
+    messages: list[str] = [
+        "📉 <b>Финансовая статистика</b>\n\n" f"Период: <code>{_safe_text(period_title)}</code>",
+    ]
     totals_per_name = defaultdict(int)
     for s in services:
         totals_per_name[s.service_name] += 1
     seen_per_name = defaultdict(int)
 
-    has_any = False
+    has_any_rows = False
     for service in services:
         seen_per_name[service.service_name] += 1
         title = _service_title(
@@ -166,21 +108,55 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
             index=seen_per_name[service.service_name],
             total=totals_per_name[service.service_name],
         )
+        title_safe = _safe_text(title)
         rows = rows_by_service.get(service.id, [])
         if not rows:
-            report += f"• <b>{title}</b>: нет данных за период\n"
+            messages.append(
+                "\n".join(
+                    [
+                        f"⏳ <b>{title_safe}</b>",
+                        "Нет замеров за выбранный период (нажмите «Статус», чтобы появилась история).",
+                    ]
+                )
+            )
             continue
 
-        has_any = True
+        has_any_rows = True
+        last = rows[-1]
+
         if not _is_monetary_service(service.service_name):
-            last = rows[-1]
-            report += f"• <b>{title}</b>\n"
-            report += "  Метрика: активные каналы\n"
-            report += f"  Текущее значение: {int(last.balance)}\n"
-            if len(rows) >= 2:
-                diff = int(round(last.balance - rows[0].balance))
-                report += f"  Изменение за период: {diff:+d}\n"
-            report += "\n"
+            if service.service_name == "wazzup":
+                lines = [
+                    f"✅ <b>{title_safe}</b>",
+                    "Метрика: <code>активные каналы</code>",
+                    f"Сейчас: <b>{int(last.balance)}</b>",
+                ]
+                if len(rows) >= 2:
+                    diff = int(round(last.balance - rows[0].balance))
+                    lines.append(f"Изменение за период: <code>{diff:+d}</code>")
+                else:
+                    lines.append("Изменение за период: <code>нужен ещё один замер</code>")
+                messages.append("\n".join(lines))
+            elif service.service_name == "yandex_geocoder":
+                cur_raw = (last.currency or "").strip().upper()
+                lines = [f"✅ <b>{title_safe}</b>", "Метрика: <code>геокодер (не деньги)</code>"]
+                if cur_raw == "REQ":
+                    lines.append(f"Оценка остатка лимита: <code>{_fmt_money(float(last.balance))}</code>")
+                else:
+                    lines.append("Проверка API: <code>доступен</code>")
+                if len(rows) >= 2:
+                    diff = float(last.balance) - float(rows[0].balance)
+                    lines.append(f"Изменение за период: <code>{diff:+.2f}</code>")
+                messages.append("\n".join(lines))
+            else:
+                messages.append(
+                    "\n".join(
+                        [
+                            f"✅ <b>{title_safe}</b>",
+                            f"Значение: <code>{_fmt_money(float(last.balance))}</code>",
+                        ]
+                    )
+                )
             continue
 
         spend_by_currency = defaultdict(float)
@@ -193,76 +169,88 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
             elif delta > 0:
                 topup_by_currency[currency] += delta
 
-        last = rows[-1]
         current_currency = _normalize_currency(last.currency)
-        report += f"• <b>{title}</b>\n"
-        report += f"  Текущий баланс: {last.balance:.2f} {current_currency}\n"
+        lines = [
+            f"✅ <b>{title_safe}</b>",
+            f"Текущий баланс: <code>{_fmt_money(float(last.balance))} {_safe_text(current_currency)}</code>",
+        ]
         if len(rows) < 2:
-            report += "  Движение средств: недостаточно данных (нужны минимум 2 замера)\n\n"
+            lines.append("Движение за период: <code>нужно минимум 2 замера</code> (нажмите «Статус» ещё раз позже).")
+            messages.append("\n".join(lines))
             continue
 
-        service_parts = []
         currencies = sorted(set(list(spend_by_currency.keys()) + list(topup_by_currency.keys())))
         if not currencies:
             currencies = [current_currency]
+        lines.append("<b>За период</b>:")
         for cur in currencies:
             spend = spend_by_currency[cur]
             topup = topup_by_currency[cur]
             totals_by_currency[cur]["spend"] += spend
             totals_by_currency[cur]["topup"] += topup
-            service_parts.append(f"{cur}: расход {spend:.2f}, пополнения {topup:.2f}")
-        report += "  " + " | ".join(service_parts) + "\n\n"
+            lines.append(
+                f"• {_safe_text(cur)} — расход <code>{_fmt_money(spend)}</code>, "
+                f"пополнения <code>{_fmt_money(topup)}</code>"
+            )
+        messages.append("\n".join(lines))
 
-    if not has_any:
-        report += "Нет успешных замеров за выбранный период.\n"
-    else:
-        report += "<b>Итого по валютам</b>\n"
+    if not has_any_rows:
+        messages.append(
+            "⚠️ Нет ни одного замера за период — сначала соберите историю через «Статус»."
+        )
+    elif totals_by_currency:
+        total_lines = ["📊 <b>Итого по валютам</b>"]
         shown_totals = 0
         for cur in sorted(totals_by_currency.keys()):
-            spend = totals_by_currency[cur]["spend"]
-            topup = totals_by_currency[cur]["topup"]
             if cur == "UNK":
                 continue
-            report += f"• {cur}: расход {spend:.2f}, пополнения {topup:.2f}\n"
+            spend = totals_by_currency[cur]["spend"]
+            topup = totals_by_currency[cur]["topup"]
+            total_lines.append(f"✅ <b>{_safe_text(cur)}</b>")
+            total_lines.append(f"Расход: <code>{_fmt_money(spend)}</code>")
+            total_lines.append(f"Пополнения: <code>{_fmt_money(topup)}</code>")
             shown_totals += 1
         if shown_totals == 0:
-            report += "• Нет денежных движений за выбранный период\n"
+            total_lines.append("Нет агрегированных сумм по валютам (проверьте валюты в замерах).")
+        messages.append("\n".join(total_lines))
 
-    report += (
-        "\nПодсказка: /stats, /stats month, /stats all, "
-        "/stats avito, /stats avito all, /stats_export all"
+    messages.append(
+        "<i>Команды:</i> <code>/stats</code>, <code>/stats month</code>, <code>/stats all</code>, "
+        "<code>/stats_export</code>"
     )
+    report = "\n\n---\n\n".join(messages)
 
     # Аудит: сохраняем сгенерированный отчёт в БД.
     async with async_session_maker() as session:
-        user_result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = user_result.scalar_one_or_none()
-        if user:
-            session.add(
-                StatsReportHistory(
-                    user_id=user.id,
-                    period_code=period_code,
-                    service_filter=service_filter,
-                    since_at=since,
-                    report_text=report,
-                    generated_at=datetime.utcnow(),
-                )
+        user = await get_or_create_workspace_user(session)
+        session.add(
+            StatsReportHistory(
+                user_id=user.id,
+                period_code=period_code,
+                service_filter=service_filter,
+                since_at=since,
+                report_text=report,
+                generated_at=datetime.utcnow(),
             )
-            await session.commit()
-    await message.answer(report, reply_markup=get_main_menu_keyboard())
+        )
+        await session.commit()
+    n = len(messages)
+    for i, chunk in enumerate(messages):
+        if i > 0:
+            await asyncio.sleep(SERVICE_MESSAGE_DELAY_SEC)
+        await message.answer(
+            chunk,
+            reply_markup=get_main_menu_keyboard() if i == n - 1 else None,
+        )
 
 
 async def _send_stats_export_csv(message: types.Message, raw_args: list[str]) -> None:
-    tg_id = message.from_user.id
     service_filter, period_arg = _parse_stats_args(raw_args)
     since, period_title, period_code = _parse_since(period_arg)
 
     async with async_session_maker() as session:
-        user_result = await session.execute(
-            select(User).where(User.tg_id == tg_id).options(selectinload(User.services))
-        )
-        user = user_result.scalar_one_or_none()
-        if not user or not user.services:
+        user = await get_or_create_workspace_user_with_services(session)
+        if not user.services:
             await message.answer(
                 "📤 <b>Экспорт</b>\n\nНет добавленных сервисов.",
                 reply_markup=get_main_menu_keyboard(),
@@ -437,20 +425,18 @@ async def _send_stats_export_csv(message: types.Message, raw_args: list[str]) ->
 
     # Храним факт генерации экспорта.
     async with async_session_maker() as session:
-        user_result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = user_result.scalar_one_or_none()
-        if user:
-            session.add(
-                StatsReportHistory(
-                    user_id=user.id,
-                    period_code=f"csv:{period_code}",
-                    service_filter=service_filter,
-                    since_at=since,
-                    report_text=f"CSV export: {filename} ({period_title})",
-                    generated_at=datetime.utcnow(),
-                )
+        user = await get_or_create_workspace_user(session)
+        session.add(
+            StatsReportHistory(
+                user_id=user.id,
+                period_code=f"csv:{period_code}",
+                service_filter=service_filter,
+                since_at=since,
+                report_text=f"CSV export: {filename} ({period_title})",
+                generated_at=datetime.utcnow(),
             )
-            await session.commit()
+        )
+        await session.commit()
 
     await message.answer_document(
         file,

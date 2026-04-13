@@ -2,11 +2,14 @@ from datetime import datetime
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
+from src.api.router import router as api_v1_router
 from src.core.config import settings
-from src.database.models import User, Service, BalanceHistory
+from src.core.workspace import get_or_create_workspace_user
+from src.database.models import Service, BalanceHistory
 from src.database.session import async_session_maker
 
 app = FastAPI(title="Balance Hub OAuth")
+app.include_router(api_v1_router)
 
 
 @app.get("/")
@@ -29,7 +32,8 @@ async def oauth_callback(service_name: str, code: str = None, error: str = None)
 
 
 class ManualBalanceUpdateRequest(BaseModel):
-    tg_id: int
+    """tg_id в теле опционален: привязка идёт к общему workspace (SHARED_WORKSPACE_TG_ID / BOT_ADMINS)."""
+    tg_id: int | None = None
     label: str
     balance: float
     currency: str = "RUB"
@@ -46,10 +50,7 @@ async def _apply_manual_balance(
         raise HTTPException(status_code=401, detail="Invalid internal token")
 
     async with async_session_maker() as session:
-        user_result = await session.execute(select(User).where(User.tg_id == payload.tg_id))
-        user = user_result.scalar_one_or_none()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        user = await get_or_create_workspace_user(session)
 
         services_result = await session.execute(
             select(Service).where(Service.user_id == user.id, Service.service_name == service_name)

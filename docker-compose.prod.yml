@@ -61,6 +61,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    ports:
+      # Без этого с хоста curl http://127.0.0.1:8000/... не доходит до uvicorn (только reverse-proxy в shared-network).
+      - "127.0.0.1:${WEB_PORT:-8000}:8000"
     networks:
       - internal
       - shared-network

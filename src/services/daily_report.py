@@ -7,13 +7,13 @@ import json
 import html
 
 from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-
 from src.core.config import settings
 from src.core.logger import setup_logger
 from src.core.timezone import format_app_dt
 from src.database.models import BalanceHistory, Service, User
+from src.services.base import connector_wait_timeout_seconds
 from src.database.session import async_session_maker
+from src.core.workspace import get_or_create_workspace_user_with_services
 from src.services.providers.avito import AvitoConnector
 from src.services.providers.hosterby import HosterByConnector
 from src.services.providers.regru import RegRuConnector
@@ -23,10 +23,12 @@ from src.services.providers.wazzup import WazzupConnector
 from src.services.providers.timewebcloud import TimewebCloudConnector
 from src.services.providers.selectel import SelectelConnector
 from src.services.local_scrapers import run_local_scrapers_if_enabled
+from src.services.providers.yandex_cloud import YandexCloudConnector
+from src.services.providers.yandex_geocoder import YandexGeocoderConnector
 
 logger = setup_logger(__name__)
 
-NON_MONETARY_SERVICES = {"wazzup"}
+NON_MONETARY_SERVICES = {"wazzup", "yandex_geocoder"}
 CURRENCY_ALIASES = {"RUR": "RUB", "RUB": "RUB", "RUBLES": "RUB", "RUBLE": "RUB", "РУБ": "RUB"}
 SERVICE_CONNECTORS = {
     "umnico": UmnicoConnector,
@@ -37,6 +39,8 @@ SERVICE_CONNECTORS = {
     "smsaero": SMSAeroConnector,
     "timewebcloud": TimewebCloudConnector,
     "selectel": SelectelConnector,
+    "yandex_cloud": YandexCloudConnector,
+    "yandex_geocoder": YandexGeocoderConnector,
 }
 
 
@@ -111,69 +115,81 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
     # are included in the final aggregated report.
     await run_local_scrapers_if_enabled(reason="daily_report_pre_refresh")
 
-    async with async_session_maker() as session:
-        for _, service, credentials in services:
-            if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
-                if "manual_balance" in credentials:
-                    try:
-                        bal = float(credentials.get("manual_balance", 0.0))
-                    except (TypeError, ValueError):
-                        continue
-                    cur = str(credentials.get("manual_currency", "RUB"))
-                    _record_snapshot(session, service.id, bal, cur, status="OK")
-                continue
+    sem = asyncio.Semaphore(6)
 
-            connector_cls = SERVICE_CONNECTORS.get(service.service_name)
-            if not connector_cls:
+    async def _fetch_one(service: Service, credentials: dict) -> tuple[int, float, str] | None:
+        if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
+            if "manual_balance" in credentials:
+                try:
+                    bal = float(credentials.get("manual_balance", 0.0))
+                except (TypeError, ValueError):
+                    return None
+                cur = str(credentials.get("manual_currency", "RUB"))
+                return (service.id, bal, cur)
+            return None
+
+        connector_cls = SERVICE_CONNECTORS.get(service.service_name)
+        if not connector_cls:
+            return None
+
+        async with sem:
+            connector = connector_cls(credentials=credentials)
+            balance_data = await asyncio.wait_for(
+                connector.get_balance_data(),
+                timeout=connector_wait_timeout_seconds(service.service_name),
+            )
+        if balance_data.status != "OK":
+            return None
+        return (service.id, float(balance_data.balance), str(balance_data.currency))
+
+    tasks: list[asyncio.Task[tuple[int, float, str] | None]] = []
+    for _, service, credentials in services:
+        tasks.append(asyncio.create_task(_fetch_one(service, credentials)))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    async with async_session_maker() as session:
+        for res, (_, service, _) in zip(results, services):
+            if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
                 continue
-            try:
-                connector = connector_cls(credentials=credentials)
-                balance_data = await asyncio.wait_for(connector.get_balance_data(), timeout=12.0)
-                if balance_data.status == "OK":
-                    _record_snapshot(
-                        session,
-                        service.id,
-                        float(balance_data.balance),
-                        str(balance_data.currency),
-                        status="OK",
-                    )
-            except Exception as exc:
+            if isinstance(res, Exception):
                 logger.warning(
                     "Daily pre-refresh failed service_id=%s name=%s err=%s",
                     service.id,
                     service.service_name,
-                    exc,
+                    res,
                 )
                 continue
+            if res is None:
+                continue
+            service_id, bal, cur = res
+            _record_snapshot(session, service_id, bal, cur, status="OK")
         await session.commit()
 
 
-async def build_daily_group_report() -> str:
+async def build_daily_group_report() -> list[str]:
     now_utc = datetime.utcnow()
     since = now_utc - timedelta(days=1)
 
     async with async_session_maker() as session:
-        users = (
-            await session.execute(select(User).options(selectinload(User.services)))
-        ).scalars().all()
+        user = await get_or_create_workspace_user_with_services(session)
 
         services = []
-        for user in users:
-            for service in user.services:
-                if not service.is_active or service.service_name == "mango_scraper":
-                    continue
-                credentials = service.credentials or {}
-                if isinstance(credentials, str):
-                    try:
-                        credentials = json.loads(credentials)
-                    except Exception:
-                        credentials = {}
-                if not isinstance(credentials, dict):
+        for service in user.services:
+            if not service.is_active or service.service_name == "mango_scraper":
+                continue
+            credentials = service.credentials or {}
+            if isinstance(credentials, str):
+                try:
+                    credentials = json.loads(credentials)
+                except Exception:
                     credentials = {}
-                services.append((user, service, credentials))
+            if not isinstance(credentials, dict):
+                credentials = {}
+            services.append((user, service, credentials))
 
         if not services:
-            return "📊 <b>Ежедневная сводка</b>\n\nНет активных сервисов."
+            return ["📊 <b>Ежедневная сводка</b>\n\nНет активных сервисов."]
 
     # 1) First refresh current balances from providers/manual sources.
     await _refresh_current_balances(services)
@@ -255,33 +271,32 @@ async def build_daily_group_report() -> str:
                 f"  Активные каналы: <b>{int(last.balance)}</b> (изменение <code>{diff:+.0f}</code>)"
             )
 
-    report = (
+    messages: list[str] = [
         "📊 <b>Ежедневная сводка</b>\n"
         "Период: последние 24ч (MSK)\n"
-        f"Сформировано: {format_app_dt(now_utc)}\n\n"
-    )
+        f"Сформировано: <code>{_safe_text(format_app_dt(now_utc))}</code>"
+    ]
 
-    for user in users:
-        blocks = user_blocks.get(user.id)
-        if not blocks:
-            continue
-        uname = f"@{user.username}" if user.username else f"tg_id={user.tg_id}"
-        report += f"<b>👤 {uname}</b>\n" + "\n\n".join(blocks) + "\n\n"
+    if services:
+        workspace_user = services[0][0]
+        blocks = user_blocks.get(workspace_user.id)
+        if blocks:
+            for block in blocks:
+                messages.append(block)
 
-    report += "<b>Итого по валютам</b>\n"
+    totals_lines = ["📊 <b>Итого по валютам</b>"]
     if not totals_by_currency:
-        report += "• Нет денежных движений за период\n"
+        totals_lines.append("• Нет денежных движений за период")
     else:
         for cur in sorted(totals_by_currency.keys()):
-            report += (
-                f"• {cur}: расход {totals_by_currency[cur]['spend']:.2f}, "
-                f"пополнения {totals_by_currency[cur]['topup']:.2f}\n"
+            totals_lines.append(
+                f"• {_safe_text(cur)}: расход <code>{totals_by_currency[cur]['spend']:.2f}</code>, "
+                f"пополнения <code>{totals_by_currency[cur]['topup']:.2f}</code>"
             )
+    messages.append("\n".join(totals_lines))
 
     if low_balance_alerts:
-        report += "\n<b>Пороговые алерты</b>\n" + "\n".join(low_balance_alerts)
+        messages.append("<b>Пороговые алерты</b>\n" + "\n".join(low_balance_alerts))
 
-    if len(report) > 3900:
-        report = report[:3850] + "\n\n…(сокращено)"
-    return report
+    return messages
 

@@ -2,9 +2,9 @@ from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command
 from aiogram.filters.state import StateFilter
-from sqlalchemy import select
-from src.database.models import User, Service
+from src.database.models import Service
 from src.database.session import async_session_maker
+from src.core.workspace import get_or_create_workspace_user
 from src.bot.keyboards.services import get_services_keyboard, get_cancel_keyboard
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.bot.states.add_service import AddServiceStates
@@ -18,20 +18,15 @@ JWT_SERVICES = {"umnico"}
 
 
 async def _save_service_for_user(
-    tg_id: int,
-    username: str | None,
     service_name: str,
     encrypted_key: str,
     label: str | None = None,
+    *,
+    actor_tg_id: int | None = None,
+    actor_username: str | None = None,
 ) -> None:
     async with async_session_maker() as session:
-        result = await session.execute(select(User).where(User.tg_id == tg_id))
-        user = result.scalar_one_or_none()
-
-        if not user:
-            user = User(tg_id=tg_id, username=username)
-            session.add(user)
-            await session.flush()
+        user = await get_or_create_workspace_user(session)
 
         service = Service(
             user_id=user.id,
@@ -42,6 +37,12 @@ async def _save_service_for_user(
         )
         session.add(service)
         await session.commit()
+        logger.info(
+            "Service added to workspace service=%s actor_tg_id=%s actor_username=%s",
+            service_name,
+            actor_tg_id,
+            actor_username,
+        )
 
 
 @router.message(Command("add"))
@@ -97,11 +98,44 @@ async def process_service_selection(callback: types.CallbackQuery, state: FSMCon
             "Ключ находится в Wazzup: Интеграция с CRM -> API -> Подключить.\n\n"
             "Для отмены: /cancel"
         )
+    elif service_name == "hosterby":
+        prompt = (
+            "🔑 <b>Hoster.by — нужен JWT access token</b>\n\n"
+            "В журнале ключей у вас <b>Access Key</b> и <b>Secret Key</b> — "
+            "их <b>нельзя</b> вставлять в бот как один токен.\n\n"
+            "Сделайте так:\n"
+            "1) Откройте "
+            "<a href=\"https://serviceapi.hoster.by/rest_api_docs.html\">документацию API</a>.\n"
+            "2) Найдите группу <b>ServiceAccount</b> → запрос "
+            "<b>Create service-account tokens</b> (создание токенов по ключам).\n"
+            "3) Скопируйте из ответа <b>access token</b> — длинная строка, обычно начинается с "
+            "<code>eyJ</code> (это JWT).\n\n"
+            "Дальше: вставьте сюда <b>только этот access token</b>.\n\n"
+            "Для отмены: /cancel"
+        )
     elif service_name == "timewebcloud":
         prompt = (
             "🔑 <b>Введите API-токен Timeweb Cloud</b>\n\n"
             "Формат: <code>token</code>\n"
             "Токен создаётся в Timeweb Cloud: API и Terraform -> Добавить токен.\n\n"
+            "Для отмены: /cancel"
+        )
+    elif service_name == "yandex_cloud":
+        prompt = (
+            "🔑 <b>Введите данные для Yandex Cloud</b>\n\n"
+            "Формат: <code>billing_account_id:token</code>\n"
+            "Пример: <code>aje0kq...:t1.9e...</code>\n\n"
+            "Где взять:\n"
+            "- <b>billing_account_id</b>: в кабинете Yandex Cloud → Billing → Account.\n"
+            "- <b>token</b>: IAM-токен или OAuth-токен (будет отправляться как <code>Authorization: Bearer ...</code>).\n\n"
+            "Для отмены: /cancel"
+        )
+    elif service_name == "yandex_geocoder":
+        prompt = (
+            "🔑 <b>Введите API-ключ Yandex Geocoder</b>\n\n"
+            "Формат: <code>api_key</code>\n\n"
+            "Ключ создаётся в кабинете Яндекс-разработчика (Maps → Geocoder).\n"
+            "Активация ключа может занять до 15 минут.\n\n"
             "Для отмены: /cancel"
         )
     elif service_name == "selectel":
@@ -197,6 +231,14 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
             )
             return
 
+    if service_name == "yandex_cloud":
+        if ":" not in api_key or not all(part.strip() for part in api_key.split(":", 1)):
+            await message.answer(
+                "❌ <b>Неверный формат ключа!</b>\n\n"
+                "Для Yandex Cloud используйте формат: <code>billing_account_id:token</code>"
+            )
+            return
+
     if service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
         parts = api_key.split("|")
         if len(parts) < 3 or not all(part.strip() for part in parts[:3]):
@@ -216,11 +258,11 @@ async def process_api_key_input(message: types.Message, state: FSMContext):
 
         encrypted_key = security_service.encrypt(api_key)
         await _save_service_for_user(
-            tg_id=message.from_user.id,
-            username=message.from_user.username,
             service_name=service_name,
             encrypted_key=encrypted_key,
             label=label,
+            actor_tg_id=message.from_user.id,
+            actor_username=message.from_user.username,
         )
         await state.clear()
 
@@ -245,8 +287,6 @@ async def cmd_confirm(message: types.Message, state: FSMContext):
     data = await state.get_data()
     service_name = data.get("selected_service")
     encrypted_key = data.get("api_key")
-    tg_id = message.from_user.id
-    
     if not all([service_name, encrypted_key]):
         await message.answer("❌ Ошибка: недостаточно данных.\nПопробуйте /add еще раз.")
         await state.clear()
@@ -254,10 +294,10 @@ async def cmd_confirm(message: types.Message, state: FSMContext):
     
     try:
         await _save_service_for_user(
-            tg_id=tg_id,
-            username=message.from_user.username,
             service_name=service_name,
             encrypted_key=encrypted_key,
+            actor_tg_id=message.from_user.id,
+            actor_username=message.from_user.username,
         )
         await state.clear()
         await message.answer(
