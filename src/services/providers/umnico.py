@@ -15,7 +15,6 @@ class UmnicoConnector(BaseAPIConnector):
     service_name = "umnico"
     service_icon = "💬"
     
-    # ✅ URL без пробелов в конце!
     API_URL = "https://api.umnico.com/v1.3/account/me/tariff"
     INTEGRATIONS_URL = "https://api.umnico.com/v1.3/integrations"
 
@@ -51,7 +50,6 @@ class UmnicoConnector(BaseAPIConnector):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 api_key = self._resolve_api_key()
-                # 🔍 Логирование
                 token_preview = self.credentials.get('api_key', '')[:20] + '...' if self.credentials.get('api_key') else 'EMPTY'
                 logger.info(f"🔌 TEST REQUEST to: {self.API_URL}")
                 logger.info(f"🔑 Token preview: {token_preview}")
@@ -94,21 +92,33 @@ class UmnicoConnector(BaseAPIConnector):
                 response.raise_for_status()
                 data = response.json()
                 
-                # ✅ Парсим ответ
                 balance_str = data.get('value', '0')
                 balance = float(balance_str) if balance_str else 0.0
                 currency = data.get('currency', 'RUB')
                 
                 # Дата окончания тарифа
-                expiration_str = data.get('expiration')
+                expiration_raw = (
+                    data.get("valid_to")
+                    or data.get("validTo")
+                    or data.get("expiration")
+                    or data.get("expires_at")
+                    or data.get("expired_at")
+                    or data.get("expire_at")
+                    or data.get("expireAt")
+                    or data.get("expiration_at")
+                    or data.get("expirationAt")
+                )
                 expiration = None
-                if expiration_str:
+                if expiration_raw:
                     try:
-                        expiration = datetime.fromisoformat(
-                            expiration_str.replace('Z', '+00:00')
-                        )
-                    except ValueError:
-                        pass
+                        if isinstance(expiration_raw, (int, float)):
+                            expiration = datetime.fromtimestamp(float(expiration_raw))
+                        else:
+                            expiration_str = str(expiration_raw).strip()
+                            # Common formats: ISO8601 with Z / with offset.
+                            expiration = datetime.fromisoformat(expiration_str.replace("Z", "+00:00"))
+                    except Exception:
+                        expiration = None
                 
                 logger.info(f"✅ Balance parsed: {balance} {currency}")
 

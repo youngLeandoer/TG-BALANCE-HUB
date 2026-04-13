@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-from src.bot.request_guard import get_guard_lock
+from src.bot.request_guard import clear_current_task, get_guard_lock, set_current_task
 
 
 def _title_for_event(event: TelegramObject) -> str:
@@ -39,6 +40,17 @@ def _should_bypass(event: TelegramObject) -> bool:
     if isinstance(event, Message):
         text = (event.text or "").strip()
         if text.startswith("/cancel"):
+            return True
+        if text == "❌ Отмена":
+            return True
+        # Healthcheck must work even while /status (scrapers) holds the global lock.
+        if text.startswith("/healthcheck"):
+            return True
+        if text in ("📡 Healthcheck", "🩺 Healthcheck"):
+            return True
+        if text.lower() == "healthcheck":
+            return True
+        if len(text) <= 32 and text.endswith("Healthcheck"):
             return True
     return False
 
@@ -79,5 +91,12 @@ class RequestGuardMiddleware(BaseMiddleware):
             return None
 
         async with lock:
-            return await handler(event, data)
+            task = asyncio.current_task()
+            if task is not None:
+                set_current_task(tg_id=tg_id, task=task)
+            try:
+                return await handler(event, data)
+            finally:
+                if task is not None:
+                    clear_current_task(tg_id=tg_id, task=task)
 

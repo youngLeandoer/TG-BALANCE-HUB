@@ -58,7 +58,23 @@ async def run_local_scrapers_if_enabled(*, reason: str) -> None:
             stderr=asyncio.subprocess.STDOUT,
             env=os.environ.copy(),
         )
-        out, _ = await proc.communicate()
+        try:
+            out, _ = await proc.communicate()
+        except asyncio.CancelledError:
+            # If user cancels /status, try to stop the scraper subprocess too.
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            raise
+
         text = (out or b"").decode(errors="replace").strip()
         if proc.returncode != 0:
             logger.warning(

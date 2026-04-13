@@ -4,7 +4,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.storage.redis import RedisStorage
 from redis.asyncio import from_url
@@ -22,6 +24,7 @@ from src.bot.handlers.stats import router as stats_router
 from src.bot.handlers.remove_service import router as remove_service_router
 from src.bot.keyboards.main_menu import get_main_menu_keyboard
 from src.bot.middlewares.request_guard import RequestGuardMiddleware
+from src.bot.request_guard import cancel_current_task, has_running_task
 from src.services.daily_report import build_daily_group_report
 
 logger = setup_logger(__name__)
@@ -38,6 +41,7 @@ MAIN_MENU_BUTTONS = (
     "📤 Экспорт CSV (месяц)",
     "📤 Экспорт CSV (всё время)",
     "ℹ️ Help",
+    "📡 Healthcheck",
     "🩺 Healthcheck",
     "❌ Отмена",
 )
@@ -47,7 +51,10 @@ async def on_startup(bot: Bot):
     logger.info(f"Bot started! Bot ID: {bot.id}")
     global daily_report_task
     if settings.DAILY_STATS_ENABLED and settings.DAILY_STATS_CHAT_ID:
-        daily_report_task = asyncio.create_task(_daily_report_loop(bot))
+        if daily_report_task and not daily_report_task.done():
+            logger.info("Daily report loop already running (skip duplicate on_startup)")
+        else:
+            daily_report_task = asyncio.create_task(_daily_report_loop(bot))
         if settings.DAILY_STATS_INTERVAL_MINUTES > 0:
             logger.info(
                 "Daily report loop enabled chat_id=%s every %s minutes",
@@ -163,9 +170,12 @@ async def _daily_report_loop(bot: Bot):
 
 
 async def main():
+    # Longer HTTP timeout: slow/unstable routes to api.telegram.org caused bot exit after default ~60s.
+    session = AiohttpSession(timeout=120.0)
     bot = Bot(
         token=settings.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     
     # ✅ Redis для FSM storage
@@ -231,9 +241,27 @@ async def main():
     
     @dp.message(Command("cancel"))
     async def cancel_cmd(message: types.Message, state):
-        from aiogram.fsm.context import FSMContext
+        tg_id = message.from_user.id if message.from_user else None
+        if tg_id is not None:
+            cancel_current_task(tg_id=tg_id)
         await state.clear()
-        await message.answer("❌ Операция отменена")
+        await message.answer("❌ Операция отменена", reply_markup=get_main_menu_keyboard())
+
+    @dp.message(F.text == "❌ Отмена")
+    async def cancel_button_cmd(message: types.Message, state):
+        tg_id = message.from_user.id if message.from_user else None
+        if tg_id is None:
+            await message.answer("ℹ️ Нет активной операции.", reply_markup=get_main_menu_keyboard())
+            return
+
+        # Cancel any running request (including /status which is not FSM-based).
+        cancelled = cancel_current_task(tg_id=tg_id)
+        current = await state.get_state()
+        if current is None and not cancelled and not has_running_task(tg_id=tg_id):
+            await message.answer("ℹ️ Нет активной операции.", reply_markup=get_main_menu_keyboard())
+            return
+        await state.clear()
+        await message.answer("❌ Операция отменена", reply_markup=get_main_menu_keyboard())
     
     # ✅ Echo ТОЛЬКО для не-команд
     @dp.message(
@@ -247,7 +275,19 @@ async def main():
         )
     
     logger.info("Starting polling...")
-    await dp.start_polling(bot)
+    backoff = 5.0
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break
+        except TelegramNetworkError as exc:
+            logger.warning(
+                "Telegram network error (%s), retrying in %.0fs",
+                exc,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2.0, 120.0)
 
 
 if __name__ == "__main__":
