@@ -311,7 +311,8 @@ async def cmd_confirm(message: types.Message, state: FSMContext):
 
 
 @router.message(Command("cancel"))
-@router.message(F.text == "❌ Отмена")
 async def cmd_cancel(message: types.Message, state: FSMContext):
+    # /cancel is handled globally too, but keep this for backwards compatibility
+    # with users following prompts during /add flow.
     await state.clear()
     await message.answer("❌ Операция отменена", reply_markup=get_main_menu_keyboard())

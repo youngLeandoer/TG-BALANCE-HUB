@@ -105,15 +105,6 @@ def _fmt_amount(amount: float) -> str:
 async def cmd_status(message: types.Message):
     tg_id = message.from_user.id
     logger.info(f"/status requested by tg_id={tg_id}")
-    
-    # Optionally run local Playwright scrapers before building status,
-    # so the report includes fresh pushed balances (adminvps/atlex/nic) too.
-    try:
-        await asyncio.wait_for(run_local_scrapers_if_enabled(reason="status_command"), timeout=180.0)
-    except asyncio.TimeoutError:
-        logger.warning("Local scrapers timed out for /status (tg_id=%s)", tg_id)
-    except Exception as exc:
-        logger.warning("Local scrapers failed for /status (tg_id=%s): %s", tg_id, exc)
 
     async with async_session_maker() as session:
         user = await get_or_create_workspace_user_with_services(session)
@@ -152,6 +143,9 @@ async def cmd_status(message: types.Message):
             return title
 
         title_by_service_id: dict[int, str] = {}
+        scraper_service_ids: list[int] = []
+        scraper_services: list[Service] = []
+        api_services: list[Service] = []
 
         for service in user.services:
             if not service.is_active or service.service_name == "mango_scraper":
@@ -180,10 +174,18 @@ async def cmd_status(message: types.Message):
                 title_by_service_id[service.id] = build_service_title(
                     service.service_name, credentials.get("label"), base_title=base_title
                 )
+                scraper_service_ids.append(service.id)
+                scraper_services.append(service)
             else:
                 title_by_service_id[service.id] = build_service_title(service.service_name, credentials.get("label"))
+                api_services.append(service)
 
             active_services.append(service)
+
+        # Kick off local scrapers in background (do NOT block /status).
+        scraper_task: asyncio.Task | None = None
+        if scraper_services:
+            scraper_task = asyncio.create_task(run_local_scrapers_if_enabled(reason="status_command"))
 
         sem = asyncio.Semaphore(STATUS_MAX_CONCURRENCY)
 
@@ -223,6 +225,17 @@ async def cmd_status(message: types.Message):
                             block="\n".join(lines),
                             should_set_last_check=True,
                             snapshot=(manual_balance, manual_currency),
+                        )
+
+                    if settings.LOCAL_SCRAPERS_ENABLED:
+                        return _StatusResult(
+                            block="\n".join(
+                                [
+                                    f"⏳ <b>{title}</b>",
+                                    "Запрашиваю баланс через локальный скрейпер (может занять 1–3 минуты).",
+                                    "Как только получу — пришлю обновление ниже.",
+                                ]
+                            )
                         )
 
                     helper = (
@@ -373,7 +386,7 @@ async def cmd_status(message: types.Message):
 
                     if balance_data.expiration:
                         expiration_dt = to_app_tz(balance_data.expiration)
-                        lines.append(f"Оплатить до: <code>{expiration_dt.strftime('%d.%m.%Y %H:%M %Z')}</code>")
+                        lines.append(f"Оплачено до: <code>{expiration_dt.strftime('%d.%m.%Y %H:%M %Z')}</code>")
 
                     return _StatusResult(
                         block="\n".join(lines),
@@ -391,10 +404,14 @@ async def cmd_status(message: types.Message):
                     should_set_last_check=True,
                 )
 
-        results: list[_StatusResult] = await asyncio.gather(*[_fetch_one(svc) for svc in active_services])
+        # Fetch API services concurrently, but keep output snappy:
+        # - API services: immediate results
+        # - Scraper services: show "running" placeholders, then send follow-up after scrapers finish
+        ordered_services = [*api_services]
+        results: list[_StatusResult] = await asyncio.gather(*[_fetch_one(svc) for svc in ordered_services])
 
         blocks: list[str] = []
-        for service, res in zip(active_services, results):
+        for service, res in zip(ordered_services, results):
             blocks.append(res.block)
             if res.snapshot is not None:
                 bal, cur = res.snapshot
@@ -427,3 +444,112 @@ async def cmd_status(message: types.Message):
             block,
             reply_markup=get_main_menu_keyboard() if i == n - 1 else None,
         )
+
+    # Follow-up: once scrapers are done, send updated blocks for them only.
+    if scraper_task and settings.LOCAL_SCRAPERS_ENABLED:
+        await message.answer("🔁 <b>Обновление по скрейперам, ожидайте(нужно как-то оптимизировать)</b>")
+        try:
+            await asyncio.wait_for(scraper_task, timeout=180.0)
+        except asyncio.TimeoutError:
+            await message.answer(
+                "⏳ <b>Скрейперы</b>\n\n"
+                "Пока не успели завершиться (таймаут ожидания). "
+                "Попробуйте ещё раз чуть позже.",
+                reply_markup=get_main_menu_keyboard(),
+            )
+            return
+        except Exception as exc:
+            logger.warning("Local scrapers failed for /status (tg_id=%s): %s", tg_id, exc)
+            await message.answer(
+                "❌ <b>Скрейперы</b>\n\n"
+                "Не удалось получить данные со скрейперов. "
+                "Проверьте логи и попробуйте позже.",
+                reply_markup=get_main_menu_keyboard(),
+            )
+            return
+
+        async with async_session_maker() as session:
+            user2 = await get_or_create_workspace_user_with_services(session)
+            if not user2.services:
+                return
+            svc_by_id = {s.id: s for s in user2.services}
+
+            # rebuild titles with existing totals (stable output)
+            service_totals2: dict[str, int] = {}
+            for svc in user2.services:
+                if not svc.is_active or svc.service_name == "mango_scraper":
+                    continue
+                service_totals2[svc.service_name] = service_totals2.get(svc.service_name, 0) + 1
+            service_seen2: dict[str, int] = {}
+
+            def build_title2(service: Service, cred: dict[str, Any]) -> str:
+                base_title = None
+                if service.service_name == "adminvps_scraper":
+                    base_title = "AdminVPS"
+                elif service.service_name == "atlex_scraper":
+                    base_title = "ATLEX"
+                elif service.service_name == "nic_scraper":
+                    base_title = "NIC.RU"
+                title = base_title or service.service_name.title()
+                label = cred.get("label") if isinstance(cred, dict) else None
+                if label:
+                    return f"{title} ({label})"
+                total = service_totals2.get(service.service_name, 1)
+                if total > 1:
+                    current = service_seen2.get(service.service_name, 0) + 1
+                    service_seen2[service.service_name] = current
+                    return f"{title} (аккаунт {current}/{total})"
+                return title
+
+            updated_blocks: list[str] = []
+            for sid in scraper_service_ids:
+                svc = svc_by_id.get(sid)
+                if not svc or not svc.is_active:
+                    continue
+                cred: Any = svc.credentials or {}
+                if isinstance(cred, str):
+                    try:
+                        cred = json.loads(cred)
+                    except Exception:
+                        cred = {}
+                if not isinstance(cred, dict):
+                    cred = {}
+
+                title = build_title2(svc, cred)
+                if "manual_balance" not in cred:
+                    updated_blocks.append(
+                        "\n".join(
+                            [
+                                f"❌ <b>{title}</b>",
+                                "Причина: <code>скрейпер не прислал баланс</code>",
+                            ]
+                        )
+                    )
+                    continue
+
+                manual_balance = float(cred.get("manual_balance", 0.0))
+                manual_currency = str(cred.get("manual_currency", "RUB"))
+                threshold = _resolve_alert_threshold_rub(cred)
+                lines = [
+                    f"✅ <b>{title}</b>",
+                    f"Баланс: <code>{_fmt_amount(manual_balance)} {_safe_text(manual_currency)}</code>",
+                ]
+                if _normalize_currency(manual_currency) == "RUB" and manual_balance <= threshold:
+                    lines.append(f"⚠️ Ниже порога: <code>{threshold:.2f} RUB</code>")
+                manual_updated_at = cred.get("manual_updated_at")
+                if isinstance(manual_updated_at, str) and manual_updated_at:
+                    parsed = parse_iso_as_utc(manual_updated_at)
+                    lines.append(
+                        f"Обновлено: <code>{_safe_text(format_app_dt(parsed) if parsed else manual_updated_at)}</code>"
+                    )
+                updated_blocks.append("\n".join(lines))
+
+            if updated_blocks:
+                m = len(updated_blocks)
+                for i, block in enumerate(updated_blocks):
+                    if i > 0:
+                        await asyncio.sleep(SERVICE_MESSAGE_DELAY_SEC)
+                    await message.answer(
+                        block,
+                        reply_markup=get_main_menu_keyboard() if i == m - 1 else None,
+                    )

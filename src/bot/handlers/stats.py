@@ -172,7 +172,7 @@ async def _render_stats(message: types.Message, raw_args: list[str]):
         current_currency = _normalize_currency(last.currency)
         lines = [
             f"✅ <b>{title_safe}</b>",
-            f"Текущий баланс: <code>{_fmt_money(float(last.balance))} {_safe_text(current_currency)}</code>",
+            f"Баланс на момент последнего замера: <code>{_fmt_money(float(last.balance))} {_safe_text(current_currency)}</code>",
         ]
         if len(rows) < 2:
             lines.append("Движение за период: <code>нужно минимум 2 замера</code> (нажмите «Статус» ещё раз позже).")

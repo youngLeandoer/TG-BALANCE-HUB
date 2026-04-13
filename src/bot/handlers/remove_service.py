@@ -126,7 +126,15 @@ async def cb_remove_pick(callback: types.CallbackQuery):
                     types.InlineKeyboardButton(
                         text="✅ Да, удалить",
                         callback_data=f"{CB_YES}_{service_id}",
-                    ),точняю информацию по вашему вопросу, поэтому нужно немного под
+                    ),
+                    types.InlineKeyboardButton(
+                        text="❌ Отмена",
+                        callback_data=CB_NO,
+                    ),
+                ]
+            ]
+        ),
+    )
 
 @router.callback_query(F.data == CB_NO)
 async def cb_remove_cancel(callback: types.CallbackQuery):

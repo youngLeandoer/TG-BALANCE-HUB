@@ -273,7 +273,6 @@ async def build_daily_group_report() -> list[str]:
 
     messages: list[str] = [
         "📊 <b>Ежедневная сводка</b>\n"
-        "Период: последние 24ч (MSK)\n"
         f"Сформировано: <code>{_safe_text(format_app_dt(now_utc))}</code>"
     ]
 
