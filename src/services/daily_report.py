@@ -9,7 +9,8 @@ import html
 from sqlalchemy import select
 from src.core.config import settings
 from src.core.logger import setup_logger
-from src.core.timezone import format_app_dt
+from src.core.report_formatting import chunk_blocks
+from src.core.timezone import format_app_dt, to_app_tz
 from src.database.models import BalanceHistory, Service, User
 from src.services.base import connector_wait_timeout_seconds
 from src.database.session import async_session_maker
@@ -105,10 +106,15 @@ def _record_snapshot(session, service_id: int, balance: float, currency: str, st
     )
 
 
-async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) -> None:
+async def _refresh_current_balances(
+    services: list[tuple[User, Service, dict]],
+) -> dict[int, dict]:
     """
     Pull fresh balances before building report so group gets up-to-date data.
     Mirrors /status behavior but without sending per-service messages.
+
+    Returns mapping service_id → extras dict (e.g. umnico channels, expiration)
+    so report builder can render the same rich block as /status.
     """
     # If local Playwright scrapers are configured to run on the server,
     # run them once before hitting API providers so their pushed snapshots
@@ -117,7 +123,9 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
 
     sem = asyncio.Semaphore(6)
 
-    async def _fetch_one(service: Service, credentials: dict) -> tuple[int, float, str] | None:
+    async def _fetch_one(
+        service: Service, credentials: dict
+    ) -> tuple[int, float, str, dict] | None:
         if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
             if "manual_balance" in credentials:
                 try:
@@ -125,7 +133,7 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
                 except (TypeError, ValueError):
                     return None
                 cur = str(credentials.get("manual_currency", "RUB"))
-                return (service.id, bal, cur)
+                return (service.id, bal, cur, {})
             return None
 
         connector_cls = SERVICE_CONNECTORS.get(service.service_name)
@@ -140,18 +148,30 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
             )
         if balance_data.status != "OK":
             return None
-        return (service.id, float(balance_data.balance), str(balance_data.currency))
 
-    tasks: list[asyncio.Task[tuple[int, float, str] | None]] = []
+        extras: dict = {}
+        if getattr(balance_data, "expiration", None):
+            extras["expiration"] = balance_data.expiration
+        if service.service_name == "umnico":
+            raw = balance_data.error_message or ""
+            if isinstance(raw, str) and raw.strip().startswith("{"):
+                try:
+                    payload = json.loads(raw)
+                    if isinstance(payload, dict):
+                        extras["umnico"] = payload
+                except Exception:
+                    pass
+        return (service.id, float(balance_data.balance), str(balance_data.currency), extras)
+
+    tasks: list[asyncio.Task[tuple[int, float, str, dict] | None]] = []
     for _, service, credentials in services:
         tasks.append(asyncio.create_task(_fetch_one(service, credentials)))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    extras_by_service_id: dict[int, dict] = {}
     async with async_session_maker() as session:
         for res, (_, service, _) in zip(results, services):
-            if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
-                continue
             if isinstance(res, Exception):
                 logger.warning(
                     "Daily pre-refresh failed service_id=%s name=%s err=%s",
@@ -162,9 +182,15 @@ async def _refresh_current_balances(services: list[tuple[User, Service, dict]]) 
                 continue
             if res is None:
                 continue
-            service_id, bal, cur = res
+            service_id, bal, cur, extras = res
+            if extras:
+                extras_by_service_id[service_id] = extras
+            if service.service_name in {"adminvps_scraper", "atlex_scraper", "nic_scraper"}:
+                continue
             _record_snapshot(session, service_id, bal, cur, status="OK")
         await session.commit()
+
+    return extras_by_service_id
 
 
 async def build_daily_group_report() -> list[str]:
@@ -192,7 +218,7 @@ async def build_daily_group_report() -> list[str]:
             return ["📊 <b>Ежедневная сводка</b>\n\nНет активных сервисов."]
 
     # 1) First refresh current balances from providers/manual sources.
-    await _refresh_current_balances(services)
+    extras_by_service_id = await _refresh_current_balances(services)
 
     # 2) Then build report from persisted history (now includes fresh snapshots).
     async with async_session_maker() as session:
@@ -215,7 +241,11 @@ async def build_daily_group_report() -> list[str]:
 
     totals_by_currency = defaultdict(lambda: {"spend": 0.0, "topup": 0.0})
     low_balance_alerts: list[str] = []
-    user_blocks: dict[int, list[str]] = defaultdict(list)
+    # (sort_key, block). 0 = ❌ no data, 1 = ⚠️ low, 3 = ✅ ok
+    ranked_blocks: list[tuple[int, str]] = []
+    total_rub_balance = 0.0
+    has_rub = False
+    ok_count = warn_count = err_count = 0
 
     totals_per_user_service = defaultdict(int)
     for user, service, _ in services:
@@ -232,7 +262,12 @@ async def build_daily_group_report() -> list[str]:
         )
         service_rows = rows_by_service.get(service.id, [])
         if not service_rows:
-            user_blocks[user.id].append(f"• {title}: <i>нет замеров за 24ч</i>")
+            ranked_blocks.append((
+                0,
+                f"❌ <b>{_safe_text(title)}</b>\n"
+                f"Причина: <code>нет замеров за 24ч</code>",
+            ))
+            err_count += 1
             continue
 
         last = service_rows[-1]
@@ -247,41 +282,93 @@ async def build_daily_group_report() -> list[str]:
                     topup += delta
 
             currency = _normalize_currency(last.currency)
-            user_blocks[user.id].append(
-                "• "
-                f"<b>{title}</b>\n"
-                f"  Баланс: <code>{_fmt_amount(last.balance)} {currency}</code>\n"
-                f"  Расход: <code>{spend:.2f}</code> | Пополнения: <code>{topup:.2f}</code>"
-            )
+            threshold = _threshold_rub(credentials)
+            is_low = currency == "RUB" and float(last.balance) <= threshold
+            head_icon = "⚠️" if is_low else "✅"
+            lines = [
+                f"{head_icon} <b>{_safe_text(title)}</b>",
+                f"Баланс: <code>{_fmt_amount(last.balance)} {currency}</code>",
+                f"Расход: <code>{spend:.2f}</code> · Пополнения: <code>{topup:.2f}</code>",
+            ]
+
+            extras = extras_by_service_id.get(service.id, {})
+            if service.service_name == "umnico":
+                umnico_payload = extras.get("umnico") or {}
+                active = umnico_payload.get("channels_active")
+                total = umnico_payload.get("channels_total")
+                active_list = umnico_payload.get("active_channels")
+                active_more = int(umnico_payload.get("active_channels_more") or 0)
+                inactive_list = umnico_payload.get("inactive_channels")
+                inactive_more = int(umnico_payload.get("inactive_channels_more") or 0)
+                try:
+                    active_int = int(active) if active is not None else None
+                    total_int = int(total) if total is not None else None
+                except (TypeError, ValueError):
+                    active_int = total_int = None
+                if active_int is not None and total_int is not None:
+                    lines.append(f"Каналы: <b>{active_int}/{total_int}</b> активны")
+                if active_list:
+                    lines.append("✅ <b>Активные</b>:")
+                    lines.extend([f"  • <code>{_safe_text(ch)}</code>" for ch in active_list])
+                    if active_more > 0:
+                        lines.append(f"  • …и ещё <b>{active_more}</b>")
+                if inactive_list:
+                    lines.append("⛔ <b>Неактивные</b>:")
+                    lines.extend([f"  • <code>{_safe_text(ch)}</code>" for ch in inactive_list])
+                    if inactive_more > 0:
+                        lines.append(f"  • …и ещё <b>{inactive_more}</b>")
+
+            if is_low:
+                lines.append(f"⚠️ Ниже порога: <code>{threshold:.2f} RUB</code>")
+
+            expiration = extras.get("expiration")
+            if expiration:
+                expiration_dt = to_app_tz(expiration)
+                lines.append(
+                    f"Оплачено до: <code>{expiration_dt.strftime('%d.%m.%Y %H:%M %Z')}</code>"
+                )
+
+            if is_low:
+                low_balance_alerts.append(
+                    f"⚠️ <b>{_safe_text(title)}</b>: <code>{_fmt_amount(last.balance)} RUB</code> "
+                    f"(порог <code>{threshold:.2f}</code>)"
+                )
+                warn_count += 1
+            else:
+                ok_count += 1
             totals_by_currency[currency]["spend"] += spend
             totals_by_currency[currency]["topup"] += topup
+            if currency == "RUB":
+                total_rub_balance += float(last.balance)
+                has_rub = True
 
-            threshold = _threshold_rub(credentials)
-            if currency == "RUB" and float(last.balance) <= threshold:
-                low_balance_alerts.append(
-                    f"⚠️ <b>{_safe_text(title)}</b>: <code>{_fmt_amount(last.balance)} RUB</code> (порог <code>{threshold:.2f}</code>)"
-                )
+            ranked_blocks.append((1 if is_low else 3, "\n".join(lines)))
         else:
             diff = 0.0
             if len(service_rows) >= 2:
                 diff = float(service_rows[-1].balance) - float(service_rows[0].balance)
-            user_blocks[user.id].append(
-                "• "
-                f"<b>{title}</b>\n"
-                f"  Активные каналы: <b>{int(last.balance)}</b> (изменение <code>{diff:+.0f}</code>)"
-            )
+            ranked_blocks.append((
+                3,
+                f"✅ <b>{_safe_text(title)}</b>\n"
+                f"Активные каналы: <b>{int(last.balance)}</b> (изменение <code>{diff:+.0f}</code>)",
+            ))
+            ok_count += 1
 
-    messages: list[str] = [
-        "📊 <b>Ежедневная сводка</b>\n"
-        f"Сформировано: <code>{_safe_text(format_app_dt(now_utc))}</code>"
+    ranked_blocks.sort(key=lambda p: p[0])
+    service_blocks = [b for _, b in ranked_blocks]
+
+    summary_parts = [f"✅ {ok_count}"]
+    if warn_count:
+        summary_parts.append(f"⚠️ {warn_count}")
+    if err_count:
+        summary_parts.append(f"❌ {err_count}")
+    header_lines = [
+        f"📊 <b>Ежедневная сводка</b> · {' · '.join(summary_parts)}",
+        f"Сформировано: <code>{_safe_text(format_app_dt(now_utc))}</code>",
     ]
-
-    if services:
-        workspace_user = services[0][0]
-        blocks = user_blocks.get(workspace_user.id)
-        if blocks:
-            for block in blocks:
-                messages.append(block)
+    if has_rub:
+        header_lines.append(f"Суммарно: <b>{_fmt_amount(total_rub_balance)} RUB</b>")
+    header = "\n".join(header_lines)
 
     totals_lines = ["📊 <b>Итого по валютам</b>"]
     if not totals_by_currency:
@@ -292,10 +379,11 @@ async def build_daily_group_report() -> list[str]:
                 f"• {_safe_text(cur)}: расход <code>{totals_by_currency[cur]['spend']:.2f}</code>, "
                 f"пополнения <code>{totals_by_currency[cur]['topup']:.2f}</code>"
             )
-    messages.append("\n".join(totals_lines))
+    totals_block = "\n".join(totals_lines)
 
+    all_blocks = [header, *service_blocks, totals_block]
     if low_balance_alerts:
-        messages.append("<b>Пороговые алерты</b>\n" + "\n".join(low_balance_alerts))
+        all_blocks.append("<b>Пороговые алерты</b>\n" + "\n".join(low_balance_alerts))
 
-    return messages
+    return chunk_blocks(all_blocks)
 
